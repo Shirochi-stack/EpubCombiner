@@ -387,6 +387,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   title: str = "Combined EPUB",
                   toc_heading_mode: str = "fixed",
                   toc_heading_fixed: str = "Contents",
+                  use_chapter_titles_in_toc: bool = True,
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
 
@@ -556,8 +557,12 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                     except Exception:
                         continue
 
-                    # Extract a label before rewriting (so <title>/<h1> are original)
-                    label = _extract_doc_label(text) or f"Section {num}"
+                    # Determine label used in combined TOC entries
+                    if use_chapter_titles_in_toc:
+                        # Extract a label before rewriting (so <title>/<h1> are original)
+                        label = _extract_doc_label(text) or f"Section {num}"
+                    else:
+                        label = f"Section {num}"
 
                     # Rewrite asset + content references
                     text = _rewrite_asset_refs(text, mapper, content_name)
@@ -946,6 +951,11 @@ class MainWindow(QMainWindow):
         self.toc_heading_entry.textChanged.connect(self._save_config)
         opt_row.addWidget(self.toc_heading_entry)
 
+        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else Section 1, 2, …)")
+        self.use_chapter_titles_checkbox.setChecked(bool(self._cfg.get('use_chapter_titles_in_toc', True)))
+        self.use_chapter_titles_checkbox.stateChanged.connect(self._save_config)
+        opt_row.addWidget(self.use_chapter_titles_checkbox)
+
         opt_row.addStretch(1)
         layout.addLayout(opt_row)
 
@@ -1150,6 +1160,7 @@ class MainWindow(QMainWindow):
         # Merge + persist
         self._cfg['toc_heading_mode'] = 'source' if self.use_source_toc_heading.isChecked() else 'fixed'
         self._cfg['toc_heading_fixed'] = self.toc_heading_entry.text().strip() or 'Contents'
+        self._cfg['use_chapter_titles_in_toc'] = bool(self.use_chapter_titles_checkbox.isChecked())
         # Clean up legacy key if present
         if 'use_japanese_toc_heading' in self._cfg:
             self._cfg.pop('use_japanese_toc_heading', None)
@@ -1189,11 +1200,13 @@ class MainWindow(QMainWindow):
 
         toc_heading_mode = 'source' if self.use_source_toc_heading.isChecked() else 'fixed'
         toc_heading_fixed = self.toc_heading_entry.text().strip() or 'Contents'
+        use_chapter_titles_in_toc = bool(self.use_chapter_titles_checkbox.isChecked())
 
         try:
             result = combine_epubs(paths, save_path, title=title,
                                    toc_heading_mode=toc_heading_mode,
                                    toc_heading_fixed=toc_heading_fixed,
+                                   use_chapter_titles_in_toc=use_chapter_titles_in_toc,
                                    progress_callback=on_progress)
             self.progress.setValue(100)
             self.progress.setFormat("Done!")
