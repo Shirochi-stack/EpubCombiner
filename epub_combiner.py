@@ -18,6 +18,8 @@ import zipfile
 import tempfile
 from pathlib import Path
 from collections import OrderedDict
+from typing import Optional
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
 
@@ -75,6 +77,113 @@ MIMETYPE_MAP = {
 def _media_type(filename: str) -> str:
     ext = Path(filename).suffix.lower()
     return MIMETYPE_MAP.get(ext, 'application/octet-stream')
+
+
+def _posix_norm(path: str) -> str:
+    """Normalize a ZIP/EPUB internal path (always uses '/')."""
+    path = (path or '').replace('\\', '/')
+    # Strip leading '/' (EPUB hrefs are relative; some books still use leading slash)
+    if path.startswith('/'):
+        path = path.lstrip('/')
+    parts: list[str] = []
+    for p in path.split('/'):
+        if p in ('', '.'):
+            continue
+        if p == '..':
+            if parts:
+                parts.pop()
+            continue
+        parts.append(p)
+    return '/'.join(parts)
+
+
+def _norm_key(path: str) -> str:
+    """Canonical key for matching hrefs to ZIP entries (case-insensitive + url-decoded)."""
+    return _posix_norm(unquote((path or '').replace('\\', '/'))).lower()
+
+
+def _split_ref_suffix(ref: str) -> tuple[str, str]:
+    """Split a URL-ish reference into (base, suffix), preserving ?query/#frag."""
+    if not ref:
+        return '', ''
+    q = ref.find('?')
+    h = ref.find('#')
+    cut = -1
+    if q != -1 and h != -1:
+        cut = min(q, h)
+    elif q != -1:
+        cut = q
+    elif h != -1:
+        cut = h
+    if cut == -1:
+        return ref, ''
+    return ref[:cut], ref[cut:]
+
+
+class _AssetMapper:
+    """Per-EPUB map from original asset paths to combined-EPUB relative hrefs."""
+
+    def __init__(self):
+        self._map: dict[str, str] = {}
+        self._basename_targets: dict[str, set[str]] = {}
+        self._basename_map: dict[str, str] = {}
+
+    def add(self, original_zip_path: str, new_href: str):
+        key = _norm_key(original_zip_path)
+        if key:
+            self._map[key] = new_href
+
+        base = Path((original_zip_path or '').replace('\\', '/')).name
+        bkey = _norm_key(base)
+        if bkey:
+            self._basename_targets.setdefault(bkey, set()).add(new_href)
+
+    def finalize(self):
+        # Only allow basename-only matching when it is unambiguous within this EPUB.
+        self._basename_map = {
+            b: next(iter(targets))
+            for b, targets in self._basename_targets.items()
+            if len(targets) == 1
+        }
+
+    def lookup(self, old_ref: str, content_path: str) -> Optional[str]:
+        if not old_ref:
+            return None
+
+        base, suffix = _split_ref_suffix(old_ref)
+        base = (base or '').strip()
+        if not base:
+            return None
+
+        # Skip absolute URLs and non-file refs
+        if base.startswith(('http://', 'https://', 'mailto:', 'tel:', 'data:')):
+            return None
+        if base.startswith('#'):
+            return None
+
+        base = base.replace('\\', '/')
+        content_dir = _posix_norm(str(Path(content_path).parent).replace('\\', '/'))
+
+        candidates: list[str] = []
+        # Direct
+        candidates.append(_norm_key(base))
+        # Resolved relative to the content file's directory
+        if content_dir and not base.startswith('/'):
+            candidates.append(_norm_key(f"{content_dir}/{base}"))
+        elif not content_dir and not base.startswith('/'):
+            candidates.append(_norm_key(base))
+
+        # Try exact/path-based matches first
+        for c in candidates:
+            if c in self._map:
+                return self._map[c] + suffix
+
+        # Finally, try basename-only when unique
+        bkey = _norm_key(Path(base).name)
+        if bkey in self._basename_map:
+            return self._basename_map[bkey] + suffix
+
+        return None
 
 
 def _is_content_file(name: str) -> bool:
@@ -212,10 +321,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                 all_content = [
                     n for n in zf.namelist()
                     if _is_content_file(n)
-                    and not n.lower().endswith('toc.xhtml')
-                    and not n.lower().endswith('toc.html')
                     and not n.lower().endswith('toc.ncx')
-                    and 'nav' not in Path(n).stem.lower()
                 ]
 
                 ordered_content: list[str] = []
@@ -231,14 +337,14 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                 for leftover in sorted(remaining):
                     ordered_content.append(leftover)
 
-                # Map old image/css/font paths -> new paths for href rewriting
-                asset_remap: dict[str, str] = {}
+                # Track old asset paths -> new hrefs for rewriting (per input EPUB)
+                mapper = _AssetMapper()
 
                 # --- Collect images ---
                 for name in zf.namelist():
                     if _is_image_file(name):
                         data = zf.read(name)
-                        # Deduplicate by content hash
+                        # Deduplicate by content hash (across all input EPUBs)
                         import hashlib
                         h = hashlib.md5(data).hexdigest()
                         if h in image_names_used:
@@ -254,30 +360,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                                 'href': f"Images/{new_name}",
                                 'media-type': _media_type(new_name),
                             })
-                        asset_remap[name] = f"../Images/{new_name}"
-                        # Also map by basename for simpler hrefs
-                        asset_remap[Path(name).name] = f"../Images/{new_name}"
-
-                # --- Collect stylesheets ---
-                for name in zf.namelist():
-                    if _is_style_file(name):
-                        data = zf.read(name)
-                        import hashlib
-                        h = hashlib.md5(data).hexdigest()
-                        if h in style_names_used:
-                            new_name = style_names_used[h]
-                        else:
-                            new_name = f"style_{len(style_names_used) + 1}.css"
-                            style_names_used[h] = new_name
-                            with open(os.path.join(style_dir, new_name), 'wb') as f:
-                                f.write(data)
-                            manifest_items.append({
-                                'id': f"css_{len(style_names_used)}",
-                                'href': f"Styles/{new_name}",
-                                'media-type': 'text/css',
-                            })
-                        asset_remap[name] = f"../Styles/{new_name}"
-                        asset_remap[Path(name).name] = f"../Styles/{new_name}"
+                        mapper.add(name, f"../Images/{new_name}")
 
                 # --- Collect fonts ---
                 for name in zf.namelist():
@@ -298,14 +381,56 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                                 'href': f"Fonts/{new_name}",
                                 'media-type': _media_type(new_name),
                             })
-                        asset_remap[name] = f"../Fonts/{new_name}"
-                        asset_remap[Path(name).name] = f"../Fonts/{new_name}"
+                        mapper.add(name, f"../Fonts/{new_name}")
+
+                # Enable unambiguous basename matching for images/fonts before rewriting CSS.
+                mapper.finalize()
+
+                # --- Collect stylesheets (rewrite their internal url(...) refs first) ---
+                for name in zf.namelist():
+                    if _is_style_file(name):
+                        raw = zf.read(name)
+                        css_text = raw.decode('utf-8', errors='replace')
+                        css_text = _rewrite_css_refs(css_text, mapper, name)
+                        data = css_text.encode('utf-8')
+
+                        import hashlib
+                        h = hashlib.md5(data).hexdigest()
+                        if h in style_names_used:
+                            new_name = style_names_used[h]
+                        else:
+                            new_name = f"style_{len(style_names_used) + 1}.css"
+                            style_names_used[h] = new_name
+                            with open(os.path.join(style_dir, new_name), 'wb') as f:
+                                f.write(data)
+                            manifest_items.append({
+                                'id': f"css_{len(style_names_used)}",
+                                'href': f"Styles/{new_name}",
+                                'media-type': 'text/css',
+                            })
+                        mapper.add(name, f"../Styles/{new_name}")
+
+
+                # Pre-compute the new filenames for this EPUB's content files so that
+                # intra-book links (e.g. a table-of-contents page with <a href="...">)
+                # can be rewritten correctly.
+                start_num = html_counter
+                content_new_name: dict[str, str] = {}
+                for i, content_name in enumerate(ordered_content, 1):
+                    num = start_num + i
+                    content_new_name[content_name] = f"{num}.xhtml"
+
+                # Add content-file mappings to the mapper (so href= links get rewritten)
+                for old_path, new_file in content_new_name.items():
+                    mapper.add(old_path, f"../Text/{new_file}")
+
+                mapper.finalize()
 
                 # --- Process content files ---
-                for content_name in ordered_content:
-                    html_counter += 1
-                    new_filename = f"{html_counter}.xhtml"
-                    item_id = f"chapter_{html_counter}"
+                for i, content_name in enumerate(ordered_content, 1):
+                    num = start_num + i
+                    new_filename = content_new_name[content_name]
+                    item_id = f"chapter_{num}"
 
                     try:
                         raw = zf.read(content_name)
@@ -313,8 +438,8 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                     except Exception:
                         continue
 
-                    # Rewrite asset references
-                    text = _rewrite_asset_refs(text, asset_remap, content_name)
+                    # Rewrite asset + content references
+                    text = _rewrite_asset_refs(text, mapper, content_name)
 
                     out_path = os.path.join(text_dir, new_filename)
                     with open(out_path, 'w', encoding='utf-8') as f:
@@ -327,8 +452,22 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                     })
                     spine_ids.append(item_id)
 
+                html_counter = start_num + len(ordered_content)
+
         if progress_callback:
             progress_callback(90, "Writing EPUB package…")
+
+        # --- Write EPUB3 navigation document (nav.xhtml) ---
+        # Many readers use this for the clickable table of contents.
+        nav_xhtml = _build_nav_xhtml(title, html_counter)
+        with open(os.path.join(text_dir, "nav.xhtml"), 'w', encoding='utf-8') as f:
+            f.write(nav_xhtml)
+        manifest_items.append({
+            'id': 'nav',
+            'href': 'Text/nav.xhtml',
+            'media-type': 'application/xhtml+xml',
+            'properties': 'nav',
+        })
 
         # --- Write mimetype ---
         with open(os.path.join(tmp_dir, "mimetype"), 'w', encoding='ascii') as f:
@@ -372,49 +511,105 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _rewrite_asset_refs(html: str, remap: dict, content_path: str) -> str:
-    """Rewrite src= and href= references in HTML to point to new asset paths."""
-    content_dir = str(Path(content_path).parent).replace('\\', '/')
+_CSS_URL_FUNC_RE = re.compile(r"url\(\s*(?P<q>['\"]?)(?P<u>.*?)(?P=q)\s*\)", re.IGNORECASE)
+_CSS_IMPORT_RE = re.compile(r"@import\s+(?P<q>['\"])(?P<u>.*?)(?P=q)", re.IGNORECASE)
 
-    def _replace(match):
-        attr = match.group(1)   # src= or href=
-        quote = match.group(2)  # " or '
+
+def _rewrite_css_refs(css: str, mapper: _AssetMapper, content_path: str) -> str:
+    """Rewrite url(...) and @import references inside CSS."""
+
+    def _url_repl(m: re.Match) -> str:
+        q = m.group('q') or ''
+        u = m.group('u') or ''
+        u_stripped = u.strip()
+        if not u_stripped or u_stripped.startswith(('data:', 'http://', 'https://')):
+            return m.group(0)
+        new_u = mapper.lookup(u_stripped, content_path)
+        if not new_u:
+            return m.group(0)
+        return f"url({q}{new_u}{q})"
+
+    def _import_repl(m: re.Match) -> str:
+        q = m.group('q')
+        u = (m.group('u') or '').strip()
+        if not u or u.startswith(('data:', 'http://', 'https://')):
+            return m.group(0)
+        new_u = mapper.lookup(u, content_path)
+        if not new_u:
+            return m.group(0)
+        return f"@import {q}{new_u}{q}"
+
+    css = _CSS_URL_FUNC_RE.sub(_url_repl, css)
+    css = _CSS_IMPORT_RE.sub(_import_repl, css)
+    return css
+
+
+def _rewrite_asset_refs(html: str, mapper: _AssetMapper, content_path: str) -> str:
+    """Rewrite common asset references in XHTML/HTML.
+
+    Handles:
+      - src/href/xlink:href/poster attributes
+      - srcset attribute
+      - inline style="...url(...)..."
+      - <style> blocks (basic)
+    """
+
+    # 1) Rewrite common URL-bearing attributes
+    def _attr_repl(match: re.Match) -> str:
+        attr = match.group(1)
+        quote = match.group(2)
         old_ref = match.group(3)
 
-        # Skip absolute URLs and anchors
-        if old_ref.startswith(('http://', 'https://', 'mailto:', '#', 'data:')):
+        # Skip absolute URLs / anchors
+        if (old_ref or '').lstrip().startswith(('http://', 'https://', 'mailto:', 'tel:', '#', 'data:')):
             return match.group(0)
 
-        # Try to resolve the old reference
-        # Build possible keys to look up in remap
-        candidates = [old_ref]
+        new_ref = mapper.lookup(old_ref, content_path)
+        if not new_ref:
+            return match.group(0)
+        return f"{attr}={quote}{new_ref}{quote}"
 
-        # Resolve relative to the content file's directory
-        if content_dir:
-            resolved = str(Path(content_dir) / old_ref).replace('\\', '/')
-            # Normalize ../ segments
-            parts = resolved.split('/')
-            normalized = []
-            for p in parts:
-                if p == '..':
-                    if normalized:
-                        normalized.pop()
-                else:
-                    normalized.append(p)
-            candidates.append('/'.join(normalized))
+    attr_pattern = r"((?:xlink:)?(?:src|href|poster))\s*=\s*(['\"])(.*?)\2"
+    html = re.sub(attr_pattern, _attr_repl, html, flags=re.IGNORECASE)
 
-        # Just the basename
-        candidates.append(Path(old_ref).name)
+    # 2) Rewrite srcset="url 1x, url 2x" etc.
+    def _srcset_repl(match: re.Match) -> str:
+        quote = match.group(1)
+        srcset = match.group(2) or ''
+        parts = [p.strip() for p in srcset.split(',') if p.strip()]
+        out_parts: list[str] = []
+        for p in parts:
+            # split into "url" + optional descriptor(s)
+            bits = p.split()
+            if not bits:
+                continue
+            url_part = bits[0]
+            rest = ' '.join(bits[1:])
+            new_url = mapper.lookup(url_part, content_path) or url_part
+            out_parts.append((new_url + (f" {rest}" if rest else '')).strip())
+        return f"srcset={quote}{', '.join(out_parts)}{quote}"
 
-        for c in candidates:
-            if c in remap:
-                return f'{attr}={quote}{remap[c]}{quote}'
+    html = re.sub(r"srcset\s*=\s*(['\"])(.*?)\1", _srcset_repl, html, flags=re.IGNORECASE | re.DOTALL)
 
-        return match.group(0)
+    # 3) Rewrite inline style="... url(...) ..."
+    def _style_attr_repl(match: re.Match) -> str:
+        quote = match.group(1)
+        style_val = match.group(2) or ''
+        new_style = _rewrite_css_refs(style_val, mapper, content_path)
+        return f"style={quote}{new_style}{quote}"
 
-    # Match src="..." and href="..." (both quotes)
-    pattern = r'''(src|href)\s*=\s*(['"])(.*?)\2'''
-    return re.sub(pattern, _replace, html, flags=re.IGNORECASE)
+    html = re.sub(r"style\s*=\s*(['\"])(.*?)\1", _style_attr_repl, html, flags=re.IGNORECASE | re.DOTALL)
+
+    # 4) Rewrite <style> blocks (best-effort; avoids breaking markup)
+    def _style_block_repl(match: re.Match) -> str:
+        before = match.group(1)
+        css = match.group(2) or ''
+        after = match.group(3)
+        return before + _rewrite_css_refs(css, mapper, content_path) + after
+
+    html = re.sub(r"(<style\b[^>]*>)(.*?)(</style>)", _style_block_repl, html, flags=re.IGNORECASE | re.DOTALL)
+
+    return html
 
 
 def _build_content_opf(title: str, uid: str,
@@ -433,9 +628,12 @@ def _build_content_opf(title: str, uid: str,
         '    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
     ]
     for item in manifest_items:
+        props = item.get('properties', '')
+        prop_attr = f' properties="{_xml_escape(props)}"' if props else ''
         lines.append(
             f'    <item id="{_xml_escape(item["id"])}" '
-            f'href="{_xml_escape(item["href"])}" '
+            f'href="{_xml_escape(item["href"])}"'
+            f'{prop_attr} '
             f'media-type="{item["media-type"]}"/>'
         )
     lines.append('  </manifest>')
@@ -468,6 +666,33 @@ def _build_toc_ncx(title: str, uid: str, spine_ids: list[str]) -> str:
     lines.append('  </navMap>')
     lines.append('</ncx>')
     return '\n'.join(lines) + '\n'
+
+
+def _build_nav_xhtml(title: str, chapter_count: int) -> str:
+    """Build an EPUB3 navigation document (nav.xhtml) with a clickable TOC."""
+    items = []
+    for i in range(1, chapter_count + 1):
+        items.append(f'        <li><a href="{i}.xhtml">Section {i}</a></li>')
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE html>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">\n'
+        '<head>\n'
+        f'  <title>{_xml_escape(title)} - Contents</title>\n'
+        '  <meta charset="utf-8"/>\n'
+        '</head>\n'
+        '<body>\n'
+        f'  <h1>{_xml_escape(title)}</h1>\n'
+        '  <nav epub:type="toc" id="toc">\n'
+        '    <h2>Contents</h2>\n'
+        '    <ol>\n'
+        + "\n".join(items) + "\n"
+        '    </ol>\n'
+        '  </nav>\n'
+        '</body>\n'
+        '</html>\n'
+    )
 
 
 def _pack_epub(src_dir: str, output_path: str):
