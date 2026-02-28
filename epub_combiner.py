@@ -13,9 +13,11 @@ import os
 import re
 import sys
 import uuid
+import json
 import shutil
 import zipfile
 import tempfile
+import html as _html
 from pathlib import Path
 from collections import OrderedDict
 from typing import Optional
@@ -36,15 +38,51 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTreeWidget,
     QTreeWidgetItem, QAbstractItemView, QHeaderView, QProgressBar,
-    QLineEdit, QGroupBox, QStyle,
+    QLineEdit, QGroupBox, QStyle, QCheckBox,
 )
-from PySide6.QtCore import Qt, QMimeData, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import Qt, QMimeData, Signal, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _config_path() -> Path:
+    """Where to store user config.
+
+    - In development: alongside this script.
+    - When frozen (PyInstaller): alongside the executable.
+    """
+    if getattr(sys, 'frozen', False):
+        base = Path(sys.executable).resolve().parent
+    else:
+        base = Path(__file__).resolve().parent
+    return base / 'config.json'
+
+
+def load_config() -> dict:
+    path = _config_path()
+    try:
+        if path.exists():
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_config(cfg: dict) -> None:
+    path = _config_path()
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # Non-fatal (read-only folder, permissions, etc.)
+        pass
+
 
 XHTML_EXTENSIONS = {'.xhtml', '.html', '.htm', '.xml'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.bmp', '.tif', '.tiff'}
@@ -118,6 +156,75 @@ def _split_ref_suffix(ref: str) -> tuple[str, str]:
     if cut == -1:
         return ref, ''
     return ref[:cut], ref[cut:]
+
+
+def _strip_tags(s: str) -> str:
+    # Very small / safe-ish tag stripper for titles/headings.
+    return re.sub(r"<[^>]+>", "", s or "")
+
+
+def _extract_doc_label(xhtml: str) -> str:
+    """Best-effort: extract a human-friendly label from an XHTML document.
+
+    Preference order:
+      1) <title>...</title>
+      2) first <h1..h6>...</h?>
+    """
+    if not xhtml:
+        return ''
+
+    m = re.search(r"<title\b[^>]*>(.*?)</title>", xhtml, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        t = _html.unescape(_strip_tags(m.group(1))).strip()
+        if t:
+            return re.sub(r"\s+", " ", t)
+
+    m = re.search(r"<h[1-6]\b[^>]*>(.*?)</h[1-6]>", xhtml, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        t = _html.unescape(_strip_tags(m.group(1))).strip()
+        if t:
+            return re.sub(r"\s+", " ", t)
+
+    return ''
+
+
+def _detect_toc_heading(zf: zipfile.ZipFile) -> str:
+    """Try to detect a suitable TOC heading label from an input EPUB.
+
+    Heuristic: look for common TOC/nav files, then extract their <title>/<h1>.
+    """
+    names = [n.replace('\\', '/') for n in zf.namelist()]
+    candidates: list[str] = []
+
+    # Most common filenames
+    for n in names:
+        low = n.lower()
+        base = Path(low).name
+        stem = Path(low).stem
+        if base in ('nav.xhtml', 'nav.html', 'toc.xhtml', 'toc.html'):
+            candidates.append(n)
+        elif stem in ('nav', 'toc', 'contents', 'content') and Path(low).suffix in XHTML_EXTENSIONS:
+            candidates.append(n)
+
+    # De-dupe preserving order
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c not in seen:
+            ordered.append(c)
+            seen.add(c)
+
+    for c in ordered:
+        try:
+            raw = zf.read(c)
+            text = raw.decode('utf-8', errors='replace')
+        except Exception:
+            continue
+        label = _extract_doc_label(text)
+        if label:
+            return label
+
+    return ''
 
 
 class _AssetMapper:
@@ -278,6 +385,8 @@ def _get_spine_order(zf: zipfile.ZipFile) -> list[str]:
 
 def combine_epubs(epub_paths: list[str], output_path: str,
                   title: str = "Combined EPUB",
+                  toc_heading_mode: str = "fixed",
+                  toc_heading_fixed: str = "Contents",
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
 
@@ -300,10 +409,13 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         image_names_used: dict[str, str] = {}   # original hash -> new name
         style_names_used: dict[str, str] = {}
         font_names_used: dict[str, str] = {}
-        manifest_items: list[dict] = []          # {id, href, media-type}
+        manifest_items: list[dict] = []          # {id, href, media-type, properties?}
         spine_ids: list[str] = []
+        spine_labels: list[str] = []             # display labels aligned to chapter numbering
 
         total_epubs = len(epub_paths)
+
+        toc_heading_final = (toc_heading_fixed or "Contents").strip()
 
         for epub_idx, epub_path in enumerate(epub_paths):
             if progress_callback:
@@ -314,6 +426,12 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                 continue
 
             with zipfile.ZipFile(epub_path, 'r') as zf:
+                # If requested, try to capture a TOC heading from the first input EPUB.
+                if toc_heading_mode == 'source' and epub_idx == 0:
+                    detected = _detect_toc_heading(zf)
+                    if detected:
+                        toc_heading_final = detected
+
                 # Determine spine order for this EPUB
                 spine_order = _get_spine_order(zf)
 
@@ -438,6 +556,9 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                     except Exception:
                         continue
 
+                    # Extract a label before rewriting (so <title>/<h1> are original)
+                    label = _extract_doc_label(text) or f"Section {num}"
+
                     # Rewrite asset + content references
                     text = _rewrite_asset_refs(text, mapper, content_name)
 
@@ -451,6 +572,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                         'media-type': 'application/xhtml+xml',
                     })
                     spine_ids.append(item_id)
+                    spine_labels.append(label)
 
                 html_counter = start_num + len(ordered_content)
 
@@ -459,7 +581,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
 
         # --- Write EPUB3 navigation document (nav.xhtml) ---
         # Many readers use this for the clickable table of contents.
-        nav_xhtml = _build_nav_xhtml(title, html_counter)
+        nav_xhtml = _build_nav_xhtml(title, spine_labels, toc_heading=toc_heading_final)
         with open(os.path.join(text_dir, "nav.xhtml"), 'w', encoding='utf-8') as f:
             f.write(nav_xhtml)
         manifest_items.append({
@@ -492,7 +614,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
             f.write(opf)
 
         # --- Write toc.ncx (minimal, for EPUB 2 readers) ---
-        ncx = _build_toc_ncx(title, book_uuid, spine_ids)
+        ncx = _build_toc_ncx(title, book_uuid, spine_ids, spine_labels)
         with open(os.path.join(tmp_dir, "OEBPS", "toc.ncx"), 'w', encoding='utf-8') as f:
             f.write(ncx)
 
@@ -645,7 +767,7 @@ def _build_content_opf(title: str, uid: str,
     return '\n'.join(lines) + '\n'
 
 
-def _build_toc_ncx(title: str, uid: str, spine_ids: list[str]) -> str:
+def _build_toc_ncx(title: str, uid: str, spine_ids: list[str], spine_labels: list[str]) -> str:
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">',
@@ -659,8 +781,9 @@ def _build_toc_ncx(title: str, uid: str, spine_ids: list[str]) -> str:
         '  <navMap>',
     ]
     for i, sid in enumerate(spine_ids, 1):
+        label = spine_labels[i - 1] if i - 1 < len(spine_labels) else f"Section {i}"
         lines.append(f'    <navPoint id="nav_{i}" playOrder="{i}">')
-        lines.append(f'      <navLabel><text>Section {i}</text></navLabel>')
+        lines.append(f'      <navLabel><text>{_xml_escape(label)}</text></navLabel>')
         lines.append(f'      <content src="Text/{i}.xhtml"/>')
         lines.append('    </navPoint>')
     lines.append('  </navMap>')
@@ -668,24 +791,27 @@ def _build_toc_ncx(title: str, uid: str, spine_ids: list[str]) -> str:
     return '\n'.join(lines) + '\n'
 
 
-def _build_nav_xhtml(title: str, chapter_count: int) -> str:
+def _build_nav_xhtml(title: str, spine_labels: list[str], toc_heading: str = "Contents") -> str:
     """Build an EPUB3 navigation document (nav.xhtml) with a clickable TOC."""
+    toc_heading = (toc_heading or "Contents").strip()
+
     items = []
-    for i in range(1, chapter_count + 1):
-        items.append(f'        <li><a href="{i}.xhtml">Section {i}</a></li>')
+    for i, label in enumerate(spine_labels, 1):
+        safe_label = _xml_escape(label or f"Section {i}")
+        items.append(f'        <li><a href="{i}.xhtml">{safe_label}</a></li>')
 
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE html>\n'
         '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">\n'
         '<head>\n'
-        f'  <title>{_xml_escape(title)} - Contents</title>\n'
+        f'  <title>{_xml_escape(title)} - {_xml_escape(toc_heading)}</title>\n'
         '  <meta charset="utf-8"/>\n'
         '</head>\n'
         '<body>\n'
         f'  <h1>{_xml_escape(title)}</h1>\n'
         '  <nav epub:type="toc" id="toc">\n'
-        '    <h2>Contents</h2>\n'
+        f'    <h2>{_xml_escape(toc_heading)}</h2>\n'
         '    <ol>\n'
         + "\n".join(items) + "\n"
         '    </ol>\n'
@@ -795,12 +921,35 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
+        self._cfg = load_config()
+        # Backward-compat: older config used a Japanese-specific toggle.
+        if bool(self._cfg.get('use_japanese_toc_heading', False)) and not self._cfg.get('toc_heading_fixed'):
+            self._cfg['toc_heading_fixed'] = '目次'
+
         # --- Title row ---
         title_row = QHBoxLayout()
         title_row.addWidget(QLabel("Book Title:"))
         self.title_entry = QLineEdit("Combined EPUB")
         title_row.addWidget(self.title_entry)
         layout.addLayout(title_row)
+
+        # --- Options ---
+        opt_row = QHBoxLayout()
+
+        self.use_source_toc_heading = QCheckBox("Use TOC heading from first input EPUB (if found)")
+        self.use_source_toc_heading.setChecked(self._cfg.get('toc_heading_mode', 'fixed') == 'source')
+        self.use_source_toc_heading.stateChanged.connect(self._save_config)
+        opt_row.addWidget(self.use_source_toc_heading)
+
+        opt_row.addWidget(QLabel("TOC heading:"))
+        self.toc_heading_entry = QLineEdit(self._cfg.get('toc_heading_fixed', 'Contents'))
+        self.toc_heading_entry.textChanged.connect(self._save_config)
+        opt_row.addWidget(self.toc_heading_entry)
+
+        opt_row.addStretch(1)
+        layout.addLayout(opt_row)
+
+        self._sync_toc_heading_ui()
 
         # --- List ---
         self.tree = EpubListWidget()
@@ -994,6 +1143,19 @@ class MainWindow(QMainWindow):
     def _clear_all(self):
         self.tree.clear()
 
+    def _sync_toc_heading_ui(self):
+        self.toc_heading_entry.setEnabled(not self.use_source_toc_heading.isChecked())
+
+    def _save_config(self):
+        # Merge + persist
+        self._cfg['toc_heading_mode'] = 'source' if self.use_source_toc_heading.isChecked() else 'fixed'
+        self._cfg['toc_heading_fixed'] = self.toc_heading_entry.text().strip() or 'Contents'
+        # Clean up legacy key if present
+        if 'use_japanese_toc_heading' in self._cfg:
+            self._cfg.pop('use_japanese_toc_heading', None)
+        save_config(self._cfg)
+        self._sync_toc_heading_ui()
+
     def _combine(self):
         count = self.tree.topLevelItemCount()
         if count < 2:
@@ -1025,15 +1187,45 @@ class MainWindow(QMainWindow):
             self.progress.setFormat(msg)
             QApplication.processEvents()
 
+        toc_heading_mode = 'source' if self.use_source_toc_heading.isChecked() else 'fixed'
+        toc_heading_fixed = self.toc_heading_entry.text().strip() or 'Contents'
+
         try:
             result = combine_epubs(paths, save_path, title=title,
+                                   toc_heading_mode=toc_heading_mode,
+                                   toc_heading_fixed=toc_heading_fixed,
                                    progress_callback=on_progress)
             self.progress.setValue(100)
             self.progress.setFormat("Done!")
-            QMessageBox.information(
-                self, "Success",
-                f"Combined {count} EPUBs into:\n{result}"
+            out_dir = os.path.dirname(result)
+            out_dir_url = QUrl.fromLocalFile(out_dir).toString()
+            safe_path = _html.escape(result)
+
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Success")
+            box.setTextFormat(Qt.RichText)
+            box.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            box.setText(
+                f"<p>Combined {count} EPUBs into:</p>"
+                f"<p><b>{safe_path}</b></p>"
+                f"<p><a href=\"{out_dir_url}\">Open output folder</a></p>"
             )
+
+            # PySide6 QMessageBox doesn't expose setOpenExternalLinks(); hook the internal label.
+            msg_label = box.findChild(QLabel, "qt_msgbox_label") or box.findChild(QLabel)
+            if msg_label is not None:
+                msg_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+                try:
+                    msg_label.linkActivated.connect(lambda url: QDesktopServices.openUrl(QUrl(url)))
+                except Exception:
+                    pass
+            open_btn = box.addButton("Open Folder", QMessageBox.ActionRole)
+            box.addButton(QMessageBox.Ok)
+            box.exec()
+
+            if box.clickedButton() == open_btn:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(out_dir))
         except Exception as e:
             self.progress.setValue(0)
             self.progress.setFormat("Error")
