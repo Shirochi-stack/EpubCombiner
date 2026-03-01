@@ -229,6 +229,83 @@ def _normalize_ncx_src(mapped_href: str) -> str:
     return base + suffix
 
 
+def _normalize_ncx_src_from_combined_href(href: str) -> str:
+    """Normalize an href found inside *combined* XHTML (OEBPS/Text/*.xhtml).
+
+    Combined pages often link like:
+      - "10.xhtml#frag" (relative within Text/)
+      - "../Text/10.xhtml#frag" (still resolves correctly)
+
+    We normalize those to NCX src paths like:
+      - "Text/10.xhtml#frag"
+    """
+    if not href:
+        return ''
+
+    href = href.strip().replace('\\', '/')
+    if _is_external_href(href) or href.startswith('#'):
+        return ''
+
+    base, suffix = _split_ref_suffix(href)
+    base = (base or '').strip()
+    if not base:
+        return ''
+
+    # Strip leading ../
+    while base.startswith('../'):
+        base = base[3:]
+
+    base = _posix_norm(base)
+    if not base:
+        return ''
+
+    # If it's just "10.xhtml", assume it's relative to Text/.
+    if '/' not in base:
+        base = f"Text/{base}"
+
+    # Only accept links into Text/ documents.
+    if not base.lower().startswith('text/'):
+        return ''
+
+    if Path(base).suffix.lower() not in XHTML_EXTENSIONS:
+        return ''
+
+    return base + (suffix or '')
+
+
+def _extract_ncx_navpoints_from_combined_toc_xhtml(toc_xhtml: str) -> list[tuple[str, str]]:
+    """Extract (src,label) navpoints from <a href> links in a combined TOC page."""
+    if not toc_xhtml:
+        return []
+
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for m in re.finditer(
+        r"<a\b[^>]*\bhref\s*=\s*(['\"])(.*?)\1[^>]*>(.*?)</a>",
+        toc_xhtml,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        href = (m.group(2) or '').strip()
+        src = _normalize_ncx_src_from_combined_href(href)
+        if not src:
+            continue
+
+        raw_label = _html.unescape(_strip_tags(m.group(3) or '')).strip()
+        label = re.sub(r"\s+", " ", raw_label) if raw_label else ''
+        if not label:
+            # No label: skip entirely (user prefers no entry over blank text)
+            continue
+
+        k = src.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append((src, label))
+
+    return out
+
+
 def _extract_ncx_navpoints_from_toc_xhtml(toc_xhtml: str, toc_doc_path: str, mapper: "_AssetMapper") -> list[tuple[str, str]]:
     """Extract (src,label) navpoints from <a href> links in a TOC/nav XHTML file."""
     if not toc_xhtml:
@@ -679,7 +756,14 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         spine_labels: list[str] = []             # display labels aligned to chapter numbering
 
         # Optional: href-based NCX navpoints extracted from each input EPUB's own TOC/nav page.
+        # (Kept as a fallback, but we prefer extracting from the combined TOC pages.)
         href_based_ncx_navpoints: list[tuple[str, str]] = []
+
+        # Collect TOC-like pages *in the combined output* (e.g. OEBPS/Text/9.xhtml)
+        # so we can build NCX directly from the hrefs that exist in the final EPUB.
+        # Stored as (page_src, rewritten_xhtml).
+        combined_toc_pages: list[tuple[str, str]] = []
+        _combined_toc_pages_seen: set[str] = set()
 
         # If volume_toc_labeling is enabled, we may label certain TOC-like pages as
         # "Volume N: Table of Contents". Track those pages so toc.ncx can always
@@ -844,6 +928,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                         continue
 
                     # Determine label used in combined TOC entries
+                    is_volume_toc_page = False
                     if volume_toc_labeling and (not toc_page_labeled_for_this_epub) and _looks_like_toc_page(text):
                         vol_n = int(volume_number_start) + int(epub_idx)
                         suffix = (volume_toc_suffix or "Table of Contents").strip() or "Table of Contents"
@@ -852,6 +937,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                         else:
                             label = suffix
                         toc_page_labeled_for_this_epub = True
+                        is_volume_toc_page = True
 
                         # Record this TOC page for the NCX so it doesn't get replaced
                         # by a generic href-based entry like "目次".
@@ -865,6 +951,35 @@ def combine_epubs(epub_paths: list[str], output_path: str,
 
                     # Rewrite asset + content references
                     text = _rewrite_asset_refs(text, mapper, content_name)
+
+                    # Record TOC-like pages from the *combined* XHTML, for href-based NCX.
+                    if ncx_from_href_links:
+                        # Always include the per-volume TOC pages we detected.
+                        want = is_volume_toc_page
+
+                        # Also include pages that look like a TOC and have fragment links (best signal).
+                        if not want:
+                            hrefs = re.findall(r'href\s*=\s*[\"\']([^\"\']+)[\"\']', text, flags=re.IGNORECASE)
+                            internal = 0
+                            frag = 0
+                            for h in hrefs:
+                                hl = (h or '').strip().lower()
+                                if not hl or _is_external_href(hl) or hl.startswith('#'):
+                                    continue
+                                if '.xhtml' in hl or '.html' in hl or '.htm' in hl:
+                                    internal += 1
+                                    if '#' in h:
+                                        frag += 1
+                            if internal >= 5 and frag >= 1:
+                                want = True
+                            elif _looks_like_toc_page(text):
+                                want = True
+
+                        if want:
+                            page_src = f"Text/{new_filename}"
+                            if page_src not in _combined_toc_pages_seen:
+                                _combined_toc_pages_seen.add(page_src)
+                                combined_toc_pages.append((page_src, text))
 
                     out_path = os.path.join(text_dir, new_filename)
                     with open(out_path, 'w', encoding='utf-8') as f:
@@ -883,9 +998,78 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         if progress_callback:
             progress_callback(90, "Writing EPUB package…")
 
+        # --- Write toc.ncx (EPUB2 fallback TOC) ---
+        ncx_navpoints: list[tuple[str, str]] = []
+
+        # Track per-volume TOC pages so we can (a) keep their nicer labels and
+        # (b) place them at the correct position in the overall TOC.
+        volume_label_by_base: dict[str, str] = {
+            (_split_ref_suffix(src)[0] or '').lower(): label
+            for src, label in volume_toc_ncx_entries
+            if (_split_ref_suffix(src)[0] or '').strip()
+        }
+
+        # 1) Href-based (from existing <a href> links)
+        if ncx_from_href_links:
+            # Prefer extracting from TOC-like pages in the combined EPUB output.
+            # Crucially: inject the "Volume N: Table of Contents" entry *at the TOC page*
+            # instead of forcing all volume TOCs to the start.
+            combined_navpoints: list[tuple[str, str]] = []
+            for page_src, toc_xhtml in combined_toc_pages:
+                page_base = (_split_ref_suffix(page_src)[0] or '').lower()
+                vol_label = volume_label_by_base.get(page_base)
+                if vol_label:
+                    combined_navpoints.append((page_src, vol_label))
+                combined_navpoints.extend(_extract_ncx_navpoints_from_combined_toc_xhtml(toc_xhtml))
+
+            # Optional debug in the progress bar if the GUI is running.
+            if progress_callback:
+                try:
+                    progress_callback(92, f"NCX/NAV: found {len(combined_toc_pages)} TOC pages, {len(combined_navpoints)} links")
+                except Exception:
+                    pass
+
+            # Fallback: extract from source EPUB TOC/nav pages (mapped to combined).
+            candidate_navpoints = combined_navpoints or href_based_ncx_navpoints
+
+            # Keep Volume labels for volume-TOC pages (skip generic ones like "目次").
+            for src, label in candidate_navpoints:
+                base = (_split_ref_suffix(src)[0] or '').lower()
+                if base in volume_label_by_base and (label or '').strip() != (volume_label_by_base[base] or '').strip():
+                    continue
+                ncx_navpoints.append((src, label))
+
+            # If we had no combined TOC pages at all, still include the volume TOC entries.
+            if (not combined_navpoints) and volume_toc_ncx_entries:
+                # Put them in spine/file order (Text/9.xhtml, Text/49.xhtml, ...)
+                def _num(src: str) -> int:
+                    b = (_split_ref_suffix(src)[0] or '')
+                    m = re.search(r"Text/(\d+)\.xhtml$", b, flags=re.IGNORECASE)
+                    return int(m.group(1)) if m else 10**9
+                for src, lbl in sorted(volume_toc_ncx_entries, key=lambda t: _num(t[0])):
+                    ncx_navpoints.insert(0, (src, lbl))
+
+        # 2) Optional fallback: sequential spine entries ("filename-based")
+        if ncx_from_spine:
+            existing_bases = {(_split_ref_suffix(src)[0] or '').lower() for src, _ in ncx_navpoints}
+            for i in range(1, len(spine_ids) + 1):
+                src = f"Text/{i}.xhtml"
+                base = src.lower()
+                if base in existing_bases:
+                    continue
+                label = spine_labels[i - 1] if i - 1 < len(spine_labels) else ''
+                if not (label or '').strip():
+                    continue
+                ncx_navpoints.append((src, label))
+
         # --- Write EPUB3 navigation document (nav.xhtml) ---
         # Many readers use this for the clickable table of contents.
-        nav_xhtml = _build_nav_xhtml(title, spine_labels, toc_heading=toc_heading_final)
+        nav_xhtml = _build_nav_xhtml(
+            title,
+            spine_labels,
+            toc_heading=toc_heading_final,
+            navpoints=(ncx_navpoints if ncx_from_href_links else None),
+        )
         with open(os.path.join(text_dir, "nav.xhtml"), 'w', encoding='utf-8') as f:
             f.write(nav_xhtml)
         manifest_items.append({
@@ -916,37 +1100,6 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         opf = _build_content_opf(title, book_uuid, manifest_items, spine_ids)
         with open(os.path.join(tmp_dir, "OEBPS", "content.opf"), 'w', encoding='utf-8') as f:
             f.write(opf)
-
-        # --- Write toc.ncx (EPUB2 fallback TOC) ---
-        ncx_navpoints: list[tuple[str, str]] = []
-
-        volume_toc_bases = {(_split_ref_suffix(src)[0] or '').lower() for src, _ in volume_toc_ncx_entries}
-
-        # 0) Always include per-volume TOC page entries (if any).
-        # These are important labels like "Volume N: Table of Contents".
-        if volume_toc_ncx_entries:
-            ncx_navpoints.extend(volume_toc_ncx_entries)
-
-        # 1) Href-based (from source TOC/nav <a href> links)
-        if ncx_from_href_links and href_based_ncx_navpoints:
-            # Avoid letting an href-based navpoint into the TOC page itself (often
-            # labeled "目次") suppress the nicer Volume N label.
-            for src, label in href_based_ncx_navpoints:
-                base = (_split_ref_suffix(src)[0] or '').lower()
-                if base and base in volume_toc_bases:
-                    continue
-                ncx_navpoints.append((src, label))
-
-        # 2) Optional fallback: sequential spine entries ("filename-based")
-        if ncx_from_spine:
-            existing_bases = {(_split_ref_suffix(src)[0] or '').lower() for src, _ in ncx_navpoints}
-            for i in range(1, len(spine_ids) + 1):
-                src = f"Text/{i}.xhtml"
-                base = src.lower()
-                if base in existing_bases:
-                    continue
-                label = spine_labels[i - 1] if i - 1 < len(spine_labels) else f"Section {i}"
-                ncx_navpoints.append((src, label))
 
         ncx = _build_toc_ncx(title, book_uuid, spine_ids, spine_labels, navpoints=ncx_navpoints)
         with open(os.path.join(tmp_dir, "OEBPS", "toc.ncx"), 'w', encoding='utf-8') as f:
@@ -1155,18 +1308,62 @@ def _build_toc_ncx(
     return '\n'.join(lines) + '\n'
 
 
-def _build_nav_xhtml(title: str, spine_labels: list[str], toc_heading: str = "Contents") -> str:
-    """Build an EPUB3 navigation document (nav.xhtml) with a clickable TOC."""
+def _ncx_src_to_nav_href(src: str) -> str:
+    """Convert an NCX content src like 'Text/10.xhtml#frag' to a nav.xhtml href.
+
+    nav.xhtml lives in OEBPS/Text/, so links should usually be relative like '10.xhtml#frag'.
+    """
+    if not src:
+        return ''
+    src = src.strip().replace('\\', '/')
+    base, suffix = _split_ref_suffix(src)
+    base = (base or '').strip()
+    if not base:
+        return ''
+    if base.lower().startswith('text/'):
+        base = base[5:]
+    base = _posix_norm(base)
+    if not base:
+        return ''
+    return base + (suffix or '')
+
+
+def _build_nav_xhtml(
+    title: str,
+    spine_labels: list[str],
+    toc_heading: str = "Contents",
+    navpoints: Optional[list[tuple[str, str]]] = None,
+) -> str:
+    """Build an EPUB3 navigation document (nav.xhtml) with a clickable TOC.
+
+    If *navpoints* is provided, it is used as the TOC source (href,label).
+    Otherwise, the TOC is built from sequential spine labels.
+    """
     toc_heading = (toc_heading or "Contents").strip()
 
-    items = []
-    for i, label in enumerate(spine_labels, 1):
-        label = (label or '').strip()
-        if not label:
-            # Skip unlabeled entries entirely.
-            continue
-        safe_label = _xml_escape(label)
-        items.append(f'        <li><a href="{i}.xhtml">{safe_label}</a></li>')
+    items: list[str] = []
+
+    if navpoints is not None:
+        seen: set[str] = set()
+        for src, label in navpoints:
+            label = (label or '').strip()
+            if not label:
+                continue
+            href = _ncx_src_to_nav_href(src)
+            if not href:
+                continue
+            k = href.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            items.append(f'        <li><a href="{_xml_escape(href)}">{_xml_escape(label)}</a></li>')
+    else:
+        for i, label in enumerate(spine_labels, 1):
+            label = (label or '').strip()
+            if not label:
+                # Skip unlabeled entries entirely.
+                continue
+            items.append(f'        <li><a href="{i}.xhtml">{_xml_escape(label)}</a></li>')
 
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
