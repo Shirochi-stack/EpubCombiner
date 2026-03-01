@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTreeWidget,
     QTreeWidgetItem, QAbstractItemView, QHeaderView, QProgressBar,
-    QLineEdit, QGroupBox, QStyle, QCheckBox,
+    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
 )
 from PySide6.QtCore import Qt, QMimeData, Signal, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
@@ -308,6 +308,29 @@ def _is_style_file(name: str) -> bool:
 def _is_font_file(name: str) -> bool:
     return Path(name).suffix.lower() in FONT_EXTENSIONS
 
+def _is_nav_doc(name: str) -> bool:
+    """Return True for original nav documents (we generate our own nav.xhtml)."""
+    lower = name.lower()
+    stem = Path(lower).stem
+    if lower.endswith('nav.xhtml') or lower.endswith('nav.html'):
+        return True
+    if stem == 'nav':
+        return True
+    return False
+
+
+def _is_toc_doc(name: str) -> bool:
+    """Return True for original toc documents (toc.xhtml/html/ncx) we might skip."""
+    lower = name.lower()
+    stem = Path(lower).stem
+    if lower.endswith('toc.ncx'):
+        return True
+    if lower.endswith('toc.xhtml') or lower.endswith('toc.html'):
+        return True
+    if stem == 'toc':
+        return True
+    return False
+
 
 def _get_spine_order(zf: zipfile.ZipFile) -> list[str]:
     """Parse content.opf inside an EPUB and return the spine-ordered list of
@@ -388,6 +411,8 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   toc_heading_mode: str = "fixed",
                   toc_heading_fixed: str = "Contents",
                   use_chapter_titles_in_toc: bool = True,
+                  exclude_nav_docs: bool = True,
+                  exclude_toc_docs: bool = True,
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
 
@@ -440,7 +465,8 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                 all_content = [
                     n for n in zf.namelist()
                     if _is_content_file(n)
-                    and not n.lower().endswith('toc.ncx')
+                    and not (exclude_nav_docs and _is_nav_doc(n))
+                    and not (exclude_toc_docs and _is_toc_doc(n))
                 ]
 
                 ordered_content: list[str] = []
@@ -938,28 +964,13 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.title_entry)
         layout.addLayout(title_row)
 
-        # --- Options ---
-        opt_row = QHBoxLayout()
-
-        self.use_source_toc_heading = QCheckBox("Use TOC heading from first input EPUB (if found)")
-        self.use_source_toc_heading.setChecked(self._cfg.get('toc_heading_mode', 'fixed') == 'source')
-        self.use_source_toc_heading.stateChanged.connect(self._save_config)
-        opt_row.addWidget(self.use_source_toc_heading)
-
-        opt_row.addWidget(QLabel("TOC heading:"))
-        self.toc_heading_entry = QLineEdit(self._cfg.get('toc_heading_fixed', 'Contents'))
-        self.toc_heading_entry.textChanged.connect(self._save_config)
-        opt_row.addWidget(self.toc_heading_entry)
-
-        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else Section 1, 2, …)")
-        self.use_chapter_titles_checkbox.setChecked(bool(self._cfg.get('use_chapter_titles_in_toc', True)))
-        self.use_chapter_titles_checkbox.stateChanged.connect(self._save_config)
-        opt_row.addWidget(self.use_chapter_titles_checkbox)
-
-        opt_row.addStretch(1)
-        layout.addLayout(opt_row)
-
-        self._sync_toc_heading_ui()
+        # --- Settings button ---
+        settings_row = QHBoxLayout()
+        settings_btn = QPushButton("Settings…")
+        settings_btn.clicked.connect(self._open_settings)
+        settings_row.addWidget(settings_btn)
+        settings_row.addStretch(1)
+        layout.addLayout(settings_row)
 
         # --- List ---
         self.tree = EpubListWidget()
@@ -1153,19 +1164,19 @@ class MainWindow(QMainWindow):
     def _clear_all(self):
         self.tree.clear()
 
-    def _sync_toc_heading_ui(self):
-        self.toc_heading_entry.setEnabled(not self.use_source_toc_heading.isChecked())
 
     def _save_config(self):
         # Merge + persist
-        self._cfg['toc_heading_mode'] = 'source' if self.use_source_toc_heading.isChecked() else 'fixed'
-        self._cfg['toc_heading_fixed'] = self.toc_heading_entry.text().strip() or 'Contents'
-        self._cfg['use_chapter_titles_in_toc'] = bool(self.use_chapter_titles_checkbox.isChecked())
-        # Clean up legacy key if present
-        if 'use_japanese_toc_heading' in self._cfg:
-            self._cfg.pop('use_japanese_toc_heading', None)
         save_config(self._cfg)
-        self._sync_toc_heading_ui()
+        # Clean up legacy key if present
+        self._cfg.pop('use_japanese_toc_heading', None)
+        self._cfg.pop('exclude_nav_toc_docs', None)
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self._cfg, self)
+        if dlg.exec() == QDialog.Accepted:
+            self._cfg.update(dlg.values())
+            self._save_config()
 
     def _combine(self):
         count = self.tree.topLevelItemCount()
@@ -1198,15 +1209,19 @@ class MainWindow(QMainWindow):
             self.progress.setFormat(msg)
             QApplication.processEvents()
 
-        toc_heading_mode = 'source' if self.use_source_toc_heading.isChecked() else 'fixed'
-        toc_heading_fixed = self.toc_heading_entry.text().strip() or 'Contents'
-        use_chapter_titles_in_toc = bool(self.use_chapter_titles_checkbox.isChecked())
+        toc_heading_mode = self._cfg.get('toc_heading_mode', 'fixed')
+        toc_heading_fixed = self._cfg.get('toc_heading_fixed', 'Contents') or 'Contents'
+        use_chapter_titles_in_toc = bool(self._cfg.get('use_chapter_titles_in_toc', True))
+        exclude_nav_docs = bool(self._cfg.get('exclude_nav_docs', True))
+        exclude_toc_docs = bool(self._cfg.get('exclude_toc_docs', True))
 
         try:
             result = combine_epubs(paths, save_path, title=title,
                                    toc_heading_mode=toc_heading_mode,
                                    toc_heading_fixed=toc_heading_fixed,
                                    use_chapter_titles_in_toc=use_chapter_titles_in_toc,
+                                   exclude_nav_docs=exclude_nav_docs,
+                                   exclude_toc_docs=exclude_toc_docs,
                                    progress_callback=on_progress)
             self.progress.setValue(100)
             self.progress.setFormat("Done!")
@@ -1243,6 +1258,76 @@ class MainWindow(QMainWindow):
             self.progress.setValue(0)
             self.progress.setFormat("Error")
             QMessageBox.critical(self, "Error", f"Failed to combine EPUBs:\n{e}")
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # TOC heading
+        self.use_source_toc_heading = QCheckBox("Use TOC heading from first input EPUB (if found)")
+        self.use_source_toc_heading.setToolTip(
+            "If checked, the TOC heading will be auto-detected from the first EPUB's nav/toc. "
+            "The text field below is ignored in that case."
+        )
+        self.use_source_toc_heading.setChecked(cfg.get('toc_heading_mode', 'fixed') == 'source')
+        layout.addWidget(self.use_source_toc_heading)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.toc_heading_entry = QLineEdit(cfg.get('toc_heading_fixed', 'Contents'))
+        self.toc_heading_entry.setPlaceholderText("e.g. Contents, Table of Contents, 索引 …")
+        self.toc_heading_entry.setToolTip(
+            "Text used as the heading/title inside the generated nav.xhtml. "
+            "Ignored only if auto-detect above is checked."
+        )
+        form.addRow(QLabel("TOC heading (nav.xhtml h2):"), self.toc_heading_entry)
+        layout.addLayout(form)
+
+        # TOC entry labels
+        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else Section 1, 2, …)")
+        self.use_chapter_titles_checkbox.setToolTip(
+            "Checked: TOC entry labels come from each chapter's <title>/<h1>. "
+            "Unchecked: entries are named Section 1, Section 2, etc."
+        )
+        self.use_chapter_titles_checkbox.setChecked(bool(cfg.get('use_chapter_titles_in_toc', True)))
+        layout.addWidget(self.use_chapter_titles_checkbox)
+
+        # Include/exclude nav/toc
+        self.exclude_nav_checkbox = QCheckBox("Exclude original nav pages")
+        self.exclude_nav_checkbox.setToolTip("Skip nav.xhtml/nav.html from source EPUBs to avoid duplicate navigation pages.")
+        self.exclude_nav_checkbox.setChecked(bool(cfg.get('exclude_nav_docs', True)))
+        layout.addWidget(self.exclude_nav_checkbox)
+
+        self.exclude_toc_checkbox = QCheckBox("Exclude original toc pages (toc.xhtml/html/ncx)")
+        self.exclude_toc_checkbox.setToolTip("Skip toc.xhtml/toc.html/toc.ncx from source EPUBs to avoid duplicate TOCs.")
+        self.exclude_toc_checkbox.setChecked(bool(cfg.get('exclude_toc_docs', True)))
+        layout.addWidget(self.exclude_toc_checkbox)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            'toc_heading_mode': 'source' if self.use_source_toc_heading.isChecked() else 'fixed',
+            'toc_heading_fixed': self.toc_heading_entry.text().strip() or 'Contents',
+            'use_chapter_titles_in_toc': bool(self.use_chapter_titles_checkbox.isChecked()),
+            'exclude_nav_docs': bool(self.exclude_nav_checkbox.isChecked()),
+            'exclude_toc_docs': bool(self.exclude_toc_checkbox.isChecked()),
+        }
+
+    # Field stays enabled; auto-detect only controls whether its value is used.
 
 
 # ---------------------------------------------------------------------------
