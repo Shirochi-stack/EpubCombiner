@@ -308,6 +308,10 @@ def _is_style_file(name: str) -> bool:
 def _is_font_file(name: str) -> bool:
     return Path(name).suffix.lower() in FONT_EXTENSIONS
 
+def _is_container_xml(name: str) -> bool:
+    lower = name.lower().replace("\\", "/")
+    return lower.endswith("meta-inf/container.xml") or Path(lower).name == "container.xml"
+
 def _is_nav_doc(name: str) -> bool:
     """Return True for original nav documents (we generate our own nav.xhtml)."""
     lower = name.lower()
@@ -413,6 +417,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   use_chapter_titles_in_toc: bool = True,
                   exclude_nav_docs: bool = True,
                   exclude_toc_docs: bool = True,
+                  exclude_container_docs: bool = True,
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
 
@@ -467,6 +472,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                     if _is_content_file(n)
                     and not (exclude_nav_docs and _is_nav_doc(n))
                     and not (exclude_toc_docs and _is_toc_doc(n))
+                    and not (exclude_container_docs and _is_container_xml(n))
                 ]
 
                 ordered_content: list[str] = []
@@ -1214,6 +1220,7 @@ class MainWindow(QMainWindow):
         use_chapter_titles_in_toc = bool(self._cfg.get('use_chapter_titles_in_toc', True))
         exclude_nav_docs = bool(self._cfg.get('exclude_nav_docs', True))
         exclude_toc_docs = bool(self._cfg.get('exclude_toc_docs', True))
+        exclude_container_docs = bool(self._cfg.get('exclude_container_docs', True))
 
         try:
             result = combine_epubs(paths, save_path, title=title,
@@ -1222,6 +1229,7 @@ class MainWindow(QMainWindow):
                                    use_chapter_titles_in_toc=use_chapter_titles_in_toc,
                                    exclude_nav_docs=exclude_nav_docs,
                                    exclude_toc_docs=exclude_toc_docs,
+                                   exclude_container_docs=exclude_container_docs,
                                    progress_callback=on_progress)
             self.progress.setValue(100)
             self.progress.setFormat("Done!")
@@ -1312,6 +1320,11 @@ class SettingsDialog(QDialog):
         self.exclude_toc_checkbox.setChecked(bool(cfg.get('exclude_toc_docs', True)))
         layout.addWidget(self.exclude_toc_checkbox)
 
+        self.exclude_container_checkbox = QCheckBox("Exclude container.xml (META-INF locator)")
+        self.exclude_container_checkbox.setToolTip("Skip container.xml files (META-INF locator) that are not real chapters.")
+        self.exclude_container_checkbox.setChecked(bool(cfg.get('exclude_container_docs', True)))
+        layout.addWidget(self.exclude_container_checkbox)
+
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1325,6 +1338,7 @@ class SettingsDialog(QDialog):
             'use_chapter_titles_in_toc': bool(self.use_chapter_titles_checkbox.isChecked()),
             'exclude_nav_docs': bool(self.exclude_nav_checkbox.isChecked()),
             'exclude_toc_docs': bool(self.exclude_toc_checkbox.isChecked()),
+            'exclude_container_docs': bool(self.exclude_container_checkbox.isChecked()),
         }
 
     # Field stays enabled; auto-detect only controls whether its value is used.
