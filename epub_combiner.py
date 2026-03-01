@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTreeWidget,
     QTreeWidgetItem, QAbstractItemView, QHeaderView, QProgressBar,
-    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QSpinBox,
+    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QSizePolicy,
 )
 from PySide6.QtCore import Qt, QMimeData, Signal, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
@@ -1316,6 +1316,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignTop)
 
         # TOC heading
         self.use_source_toc_heading = QCheckBox("Auto detect TOC heading (from first input EPUB)")
@@ -1323,10 +1324,14 @@ class SettingsDialog(QDialog):
             "If checked, the TOC heading will be auto-detected from the first EPUB's nav/toc. "
             "The text field below is ignored in that case."
         )
-        self.use_source_toc_heading.setChecked(cfg.get('toc_heading_mode', 'fixed') == 'source')
+        # Default to auto-detect so the combined nav.xhtml heading inherits the first input EPUB.
+        self.use_source_toc_heading.setChecked(cfg.get('toc_heading_mode', 'source') == 'source')
         layout.addWidget(self.use_source_toc_heading)
 
-        form = QFormLayout()
+        self.toc_heading_widget = QWidget()
+        self.toc_heading_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        form = QFormLayout(self.toc_heading_widget)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -1339,7 +1344,7 @@ class SettingsDialog(QDialog):
         )
         self.toc_heading_label = QLabel("TOC heading (nav.xhtml h2):")
         form.addRow(self.toc_heading_label, self.toc_heading_entry)
-        layout.addLayout(form)
+        layout.addWidget(self.toc_heading_widget)
         self.use_source_toc_heading.stateChanged.connect(self._sync_heading_visibility)
         self._sync_heading_visibility()
 
@@ -1377,7 +1382,10 @@ class SettingsDialog(QDialog):
         self.volume_toc_labeling_checkbox.setChecked(bool(cfg.get('volume_toc_labeling', False)))
         layout.addWidget(self.volume_toc_labeling_checkbox)
 
-        vol_form = QFormLayout()
+        # Associated fields (hidden unless enabled)
+        self.volume_options_widget = QWidget()
+        self.volume_options_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        vol_form = QFormLayout(self.volume_options_widget)
         vol_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         vol_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
         vol_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -1398,7 +1406,10 @@ class SettingsDialog(QDialog):
         self.volume_suffix_entry.setToolTip("TOC label text to use (default: 'Table of Contents').")
         vol_form.addRow(QLabel("TOC label text:"), self.volume_suffix_entry)
 
-        layout.addLayout(vol_form)
+        layout.addWidget(self.volume_options_widget)
+
+        self.volume_toc_labeling_checkbox.stateChanged.connect(self._sync_volume_toc_visibility)
+        self._sync_volume_toc_visibility()
 
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1425,6 +1436,9 @@ class SettingsDialog(QDialog):
         auto = self.use_source_toc_heading.isChecked()
         self.toc_heading_entry.setVisible(not auto)
         self.toc_heading_label.setVisible(not auto)
+
+    def _sync_volume_toc_visibility(self, _state=None):
+        self.volume_options_widget.setVisible(self.volume_toc_labeling_checkbox.isChecked())
 
 
 # ---------------------------------------------------------------------------
