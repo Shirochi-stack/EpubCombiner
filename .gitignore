@@ -1,0 +1,9 @@
+# PyInstaller output
+build/
+dist/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.rpyc
