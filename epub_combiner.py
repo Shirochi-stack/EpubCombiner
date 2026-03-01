@@ -1278,7 +1278,7 @@ class SettingsDialog(QDialog):
         layout.setSpacing(10)
 
         # TOC heading
-        self.use_source_toc_heading = QCheckBox("Use TOC heading from first input EPUB (if found)")
+        self.use_source_toc_heading = QCheckBox("Auto detect TOC heading (from first input EPUB)")
         self.use_source_toc_heading.setToolTip(
             "If checked, the TOC heading will be auto-detected from the first EPUB's nav/toc. "
             "The text field below is ignored in that case."
@@ -1297,8 +1297,11 @@ class SettingsDialog(QDialog):
             "Text used as the heading/title inside the generated nav.xhtml. "
             "Ignored only if auto-detect above is checked."
         )
-        form.addRow(QLabel("TOC heading (nav.xhtml h2):"), self.toc_heading_entry)
+        self.toc_heading_label = QLabel("TOC heading (nav.xhtml h2):")
+        form.addRow(self.toc_heading_label, self.toc_heading_entry)
         layout.addLayout(form)
+        self.use_source_toc_heading.stateChanged.connect(self._sync_heading_visibility)
+        self._sync_heading_visibility()
 
         # TOC entry labels
         self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else Section 1, 2, …)")
@@ -1342,6 +1345,10 @@ class SettingsDialog(QDialog):
         }
 
     # Field stays enabled; auto-detect only controls whether its value is used.
+    def _sync_heading_visibility(self, _state=None):
+        auto = self.use_source_toc_heading.isChecked()
+        self.toc_heading_entry.setVisible(not auto)
+        self.toc_heading_label.setVisible(not auto)
 
 
 # ---------------------------------------------------------------------------
