@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTreeWidget,
     QTreeWidgetItem, QAbstractItemView, QHeaderView, QProgressBar,
-    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
+    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QSpinBox,
 )
 from PySide6.QtCore import Qt, QMimeData, Signal, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
@@ -186,6 +186,24 @@ def _extract_doc_label(xhtml: str) -> str:
             return re.sub(r"\s+", " ", t)
 
     return ''
+
+
+def _looks_like_toc_page(xhtml: str) -> bool:
+    """Heuristic: TOC pages tend to have many internal <a href> links."""
+    if not xhtml:
+        return False
+    body_match = re.search(r"<body[^>]*>(.*?)</body>", xhtml, flags=re.IGNORECASE | re.DOTALL)
+    body = body_match.group(1) if body_match else xhtml
+    hrefs = re.findall(r'href\s*=\s*[\"\']([^\"\']+)[\"\']', body, flags=re.IGNORECASE)
+    internal = []
+    for h in hrefs:
+        hl = (h or '').strip().lower()
+        if not hl or hl.startswith(('http://', 'https://', 'mailto:', 'tel:', '#', 'data:')):
+            continue
+        if '.xhtml' in hl or '.html' in hl or '.htm' in hl:
+            internal.append(h)
+    return len(internal) >= 5
+
 
 
 def _detect_toc_heading(zf: zipfile.ZipFile) -> str:
@@ -418,6 +436,10 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   exclude_nav_docs: bool = True,
                   exclude_toc_docs: bool = True,
                   exclude_container_docs: bool = True,
+                  volume_toc_labeling: bool = False,
+                  volume_number_start: int = 1,
+                  volume_prefix_enabled: bool = True,
+                  volume_toc_suffix: str = "Table of Contents",
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
 
@@ -457,6 +479,8 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                 continue
 
             with zipfile.ZipFile(epub_path, 'r') as zf:
+                toc_page_labeled_for_this_epub = False
+
                 # If requested, try to capture a TOC heading from the first input EPUB.
                 if toc_heading_mode == 'source' and epub_idx == 0:
                     detected = _detect_toc_heading(zf)
@@ -590,7 +614,15 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                         continue
 
                     # Determine label used in combined TOC entries
-                    if use_chapter_titles_in_toc:
+                    if volume_toc_labeling and (not toc_page_labeled_for_this_epub) and _looks_like_toc_page(text):
+                        vol_n = int(volume_number_start) + int(epub_idx)
+                        suffix = (volume_toc_suffix or "Table of Contents").strip() or "Table of Contents"
+                        if volume_prefix_enabled:
+                            label = f"Volume {vol_n}: {suffix}"
+                        else:
+                            label = suffix
+                        toc_page_labeled_for_this_epub = True
+                    elif use_chapter_titles_in_toc:
                         # Extract a label before rewriting (so <title>/<h1> are original)
                         label = _extract_doc_label(text) or f"Section {num}"
                     else:
@@ -1221,6 +1253,10 @@ class MainWindow(QMainWindow):
         exclude_nav_docs = bool(self._cfg.get('exclude_nav_docs', True))
         exclude_toc_docs = bool(self._cfg.get('exclude_toc_docs', True))
         exclude_container_docs = bool(self._cfg.get('exclude_container_docs', True))
+        volume_toc_labeling = bool(self._cfg.get('volume_toc_labeling', False))
+        volume_number_start = int(self._cfg.get('volume_number_start', 1) or 1)
+        volume_prefix_enabled = bool(self._cfg.get('volume_prefix_enabled', True))
+        volume_toc_suffix = self._cfg.get('volume_toc_suffix', 'Table of Contents') or 'Table of Contents'
 
         try:
             result = combine_epubs(paths, save_path, title=title,
@@ -1230,6 +1266,10 @@ class MainWindow(QMainWindow):
                                    exclude_nav_docs=exclude_nav_docs,
                                    exclude_toc_docs=exclude_toc_docs,
                                    exclude_container_docs=exclude_container_docs,
+                                   volume_toc_labeling=volume_toc_labeling,
+                                   volume_number_start=volume_number_start,
+                                   volume_prefix_enabled=volume_prefix_enabled,
+                                   volume_toc_suffix=volume_toc_suffix,
                                    progress_callback=on_progress)
             self.progress.setValue(100)
             self.progress.setFormat("Done!")
@@ -1328,6 +1368,38 @@ class SettingsDialog(QDialog):
         self.exclude_container_checkbox.setChecked(bool(cfg.get('exclude_container_docs', True)))
         layout.addWidget(self.exclude_container_checkbox)
 
+        # Volume TOC labeling
+        self.volume_toc_labeling_checkbox = QCheckBox("Auto-name per-volume TOC pages (Volume N: Table of Contents)")
+        self.volume_toc_labeling_checkbox.setToolTip(
+            "If enabled, pages that look like a Table of Contents (many internal links) will be labeled "
+            "as 'Volume N: Table of Contents' in the combined TOC."
+        )
+        self.volume_toc_labeling_checkbox.setChecked(bool(cfg.get('volume_toc_labeling', False)))
+        layout.addWidget(self.volume_toc_labeling_checkbox)
+
+        vol_form = QFormLayout()
+        vol_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        vol_form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        vol_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        self.volume_start_spin = QSpinBox()
+        self.volume_start_spin.setMinimum(0)
+        self.volume_start_spin.setMaximum(10_000)
+        self.volume_start_spin.setValue(int(cfg.get('volume_number_start', 1) or 1))
+        self.volume_start_spin.setToolTip("First volume number to use for the first EPUB in the list.")
+        vol_form.addRow(QLabel("Volume numbering starts at:"), self.volume_start_spin)
+
+        self.volume_prefix_checkbox = QCheckBox("Include 'Volume N:' prefix")
+        self.volume_prefix_checkbox.setChecked(bool(cfg.get('volume_prefix_enabled', True)))
+        self.volume_prefix_checkbox.setToolTip("If unchecked, the label will be just the TOC label text.")
+        vol_form.addRow(self.volume_prefix_checkbox)
+
+        self.volume_suffix_entry = QLineEdit(cfg.get('volume_toc_suffix', 'Table of Contents'))
+        self.volume_suffix_entry.setToolTip("TOC label text to use (default: 'Table of Contents').")
+        vol_form.addRow(QLabel("TOC label text:"), self.volume_suffix_entry)
+
+        layout.addLayout(vol_form)
+
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1342,6 +1414,10 @@ class SettingsDialog(QDialog):
             'exclude_nav_docs': bool(self.exclude_nav_checkbox.isChecked()),
             'exclude_toc_docs': bool(self.exclude_toc_checkbox.isChecked()),
             'exclude_container_docs': bool(self.exclude_container_checkbox.isChecked()),
+            'volume_toc_labeling': bool(self.volume_toc_labeling_checkbox.isChecked()),
+            'volume_number_start': int(self.volume_start_spin.value()),
+            'volume_prefix_enabled': bool(self.volume_prefix_checkbox.isChecked()),
+            'volume_toc_suffix': self.volume_suffix_entry.text().strip() or 'Table of Contents',
         }
 
     # Field stays enabled; auto-detect only controls whether its value is used.

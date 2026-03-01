@@ -7,3 +7,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.rpyc
+
+# Data / outputs
+*.epub
+*.json
