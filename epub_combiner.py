@@ -714,7 +714,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   title: str = "Combined EPUB",
                   toc_heading_mode: str = "fixed",
                   toc_heading_fixed: str = "Contents",
-                  use_chapter_titles_in_toc: bool = True,
+                  use_chapter_titles_in_toc: bool = False,
                   exclude_nav_docs: bool = True,
                   exclude_toc_docs: bool = True,
                   exclude_container_docs: bool = True,
@@ -722,7 +722,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   volume_number_start: int = 1,
                   volume_prefix_enabled: bool = True,
                   volume_toc_suffix: str = "Table of Contents",
-                  ncx_from_href_links: bool = False,
+                  ncx_from_href_links: bool = True,
                   ncx_from_spine: bool = True,
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
@@ -1757,7 +1757,7 @@ class MainWindow(QMainWindow):
 
         toc_heading_mode = self._cfg.get('toc_heading_mode', 'fixed')
         toc_heading_fixed = self._cfg.get('toc_heading_fixed', 'Contents') or 'Contents'
-        use_chapter_titles_in_toc = bool(self._cfg.get('use_chapter_titles_in_toc', True))
+        use_chapter_titles_in_toc = bool(self._cfg.get('use_chapter_titles_in_toc', False))
         exclude_nav_docs = bool(self._cfg.get('exclude_nav_docs', True))
         exclude_toc_docs = bool(self._cfg.get('exclude_toc_docs', True))
         exclude_container_docs = bool(self._cfg.get('exclude_container_docs', True))
@@ -1765,7 +1765,7 @@ class MainWindow(QMainWindow):
         volume_number_start = int(self._cfg.get('volume_number_start', 1) or 1)
         volume_prefix_enabled = bool(self._cfg.get('volume_prefix_enabled', True))
         volume_toc_suffix = self._cfg.get('volume_toc_suffix', 'Table of Contents') or 'Table of Contents'
-        ncx_from_href_links = bool(self._cfg.get('ncx_from_href_links', False))
+        ncx_from_href_links = bool(self._cfg.get('ncx_from_href_links', True))
         ncx_from_spine = bool(self._cfg.get('ncx_from_spine', True))
         # Href-based NCX enabled => href-only (ignore sequential fallback setting).
         if ncx_from_href_links:
@@ -1871,7 +1871,7 @@ class SettingsDialog(QDialog):
             "Checked: TOC entry labels come from each chapter's <title>/<h1>. "
             "Unchecked: chapters without existing TOC link text will be omitted from the TOC."
         )
-        self.use_chapter_titles_checkbox.setChecked(bool(cfg.get('use_chapter_titles_in_toc', True)))
+        self.use_chapter_titles_checkbox.setChecked(bool(cfg.get('use_chapter_titles_in_toc', False)))
         layout.addWidget(self.use_chapter_titles_checkbox)
 
         # NCX generation (EPUB2 fallback TOC)
@@ -1880,7 +1880,7 @@ class SettingsDialog(QDialog):
             "If checked, toc.ncx will try to follow the source book's TOC/nav hyperlinks. "
             "This can preserve per-chapter anchors and custom ordering."
         )
-        self.ncx_from_href_links_checkbox.setChecked(bool(cfg.get('ncx_from_href_links', False)))
+        self.ncx_from_href_links_checkbox.setChecked(bool(cfg.get('ncx_from_href_links', True)))
         layout.addWidget(self.ncx_from_href_links_checkbox)
 
         self.ncx_from_spine_checkbox = QCheckBox("toc.ncx: include sequential entries (filename-based fallback)")
