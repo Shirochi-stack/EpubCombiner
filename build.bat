@@ -14,10 +14,15 @@ echo Running PyInstaller...
 pyinstaller --clean EpubCombiner.spec
 echo.
 
-if exist "dist\EpubCombiner.exe" (
+set "OUT_EXE="
+for %%F in ("dist\*.exe") do (
+    set "OUT_EXE=%%~fF"
+)
+
+if defined OUT_EXE (
     echo ========================================
     echo   BUILD SUCCESSFUL
-    echo   Output: dist\EpubCombiner.exe
+    echo   Output: %OUT_EXE%
     echo ========================================
 ) else (
     echo ========================================

@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QMessageBox, QTreeWidget,
     QTreeWidgetItem, QAbstractItemView, QHeaderView, QProgressBar,
-    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QSizePolicy,
+    QLineEdit, QGroupBox, QStyle, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QSizePolicy, QLayout,
 )
 from PySide6.QtCore import Qt, QMimeData, Signal, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QDesktopServices
@@ -1315,8 +1315,10 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         layout.setAlignment(Qt.AlignTop)
+        # Keep the dialog sized to its content (prevents large empty bottom area).
+        layout.setSizeConstraint(QLayout.SetFixedSize)
 
         # TOC heading
         self.use_source_toc_heading = QCheckBox("Auto detect TOC heading (from first input EPUB)")
@@ -1431,11 +1433,10 @@ class SettingsDialog(QDialog):
             'volume_toc_suffix': self.volume_suffix_entry.text().strip() or 'Table of Contents',
         }
 
-    # Field stays enabled; auto-detect only controls whether its value is used.
+    # Hide/show the entire TOC heading row to avoid leaving blank space.
     def _sync_heading_visibility(self, _state=None):
         auto = self.use_source_toc_heading.isChecked()
-        self.toc_heading_entry.setVisible(not auto)
-        self.toc_heading_label.setVisible(not auto)
+        self.toc_heading_widget.setVisible(not auto)
 
     def _sync_volume_toc_visibility(self, _state=None):
         self.volume_options_widget.setVisible(self.volume_toc_labeling_checkbox.isChecked())
