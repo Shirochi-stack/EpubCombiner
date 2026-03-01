@@ -205,6 +205,211 @@ def _looks_like_toc_page(xhtml: str) -> bool:
     return len(internal) >= 5
 
 
+def _is_external_href(href: str) -> bool:
+    h = (href or '').strip().lower()
+    return (not h) or h.startswith(('http://', 'https://', 'mailto:', 'tel:', 'data:'))
+
+
+def _normalize_ncx_src(mapped_href: str) -> str:
+    """Normalize a mapper output href to an NCX <content src="..."> path.
+
+    We want paths relative to OEBPS/toc.ncx, typically "Text/1.xhtml".
+    The mapper returns paths like "../Text/1.xhtml".
+    """
+    if not mapped_href:
+        return ''
+    base, suffix = _split_ref_suffix(mapped_href.strip())
+    base = base.replace('\\', '/')
+    # Strip any leading ../ segments.
+    while base.startswith('../'):
+        base = base[3:]
+    base = _posix_norm(base)
+    if not base:
+        return ''
+    return base + suffix
+
+
+def _extract_ncx_navpoints_from_toc_xhtml(toc_xhtml: str, toc_doc_path: str, mapper: "_AssetMapper") -> list[tuple[str, str]]:
+    """Extract (src,label) navpoints from <a href> links in a TOC/nav XHTML file."""
+    if not toc_xhtml:
+        return []
+
+    out: list[tuple[str, str]] = []
+    seen_srcs: set[str] = set()
+
+    # Best-effort anchor extraction.
+    for m in re.finditer(
+        r"<a\b[^>]*\bhref\s*=\s*(['\"])(.*?)\1[^>]*>(.*?)</a>",
+        toc_xhtml,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        href = (m.group(2) or '').strip()
+        if not href or _is_external_href(href) or href.startswith('#'):
+            continue
+
+        # Map to combined-EPUB href.
+        mapped = mapper.lookup(href, toc_doc_path)
+        if not mapped:
+            continue
+        src = _normalize_ncx_src(mapped)
+        if not src:
+            continue
+
+        # Only keep document links (avoid Images/, Styles/, etc.)
+        base, _suffix = _split_ref_suffix(src)
+        if not base.lower().startswith('text/'):
+            continue
+        if Path(base).suffix.lower() not in XHTML_EXTENSIONS:
+            continue
+
+        # Label from anchor text.
+        raw_label = _html.unescape(_strip_tags(m.group(3) or '')).strip()
+        label = re.sub(r"\s+", " ", raw_label) if raw_label else ''
+        if not label:
+            label = Path(unquote(base)).stem or base
+
+        k = src.lower()
+        if k in seen_srcs:
+            continue
+        seen_srcs.add(k)
+        out.append((src, label))
+
+    return out
+
+
+def _rank_toc_doc_paths(zf: zipfile.ZipFile, ordered_content: list[str]) -> list[tuple[int, str, int, int]]:
+    """Return ranked TOC candidates as (score, path, fragment_link_count, internal_link_count)."""
+    names = [n.replace('\\', '/') for n in zf.namelist()]
+
+    # Candidate set: common TOC/nav names first.
+    candidates: list[str] = []
+    for n in names:
+        low = n.lower()
+        base = Path(low).name
+        stem = Path(low).stem
+        if base in ('nav.xhtml', 'nav.html', 'toc.xhtml', 'toc.html'):
+            candidates.append(n)
+        elif stem in ('nav', 'toc', 'contents', 'content') and Path(low).suffix in XHTML_EXTENSIONS:
+            candidates.append(n)
+
+    # Always include spine/content files as potential TOC pages as well.
+    for c in ordered_content:
+        cp = c.replace('\\', '/')
+        if _is_content_file(cp):
+            candidates.append(cp)
+
+    # De-dupe preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            deduped.append(c)
+            seen.add(c)
+    candidates = deduped
+
+    ranked: list[tuple[int, str, int, int]] = []
+
+    for c in candidates:
+        try:
+            text = zf.read(c).decode('utf-8', errors='replace')
+        except Exception:
+            continue
+
+        score = 0
+        base = Path(c.lower()).name
+        stem = Path(c.lower()).stem
+
+        # Filename hints
+        if base in ('toc.xhtml', 'toc.html'):
+            score += 120
+        if stem in ('toc', 'contents', 'content'):
+            score += 60
+        if base in ('nav.xhtml', 'nav.html'):
+            # Keep as a fallback, but don't let it override a richer spine TOC page.
+            score += 40
+
+        # Markup hints
+        if re.search(r"epub:type\s*=\s*['\"]toc['\"]", text, flags=re.IGNORECASE):
+            score += 50
+
+        if _looks_like_toc_page(text):
+            score += 40
+
+        # Link richness: prefer TOC pages that link to specific anchors (common in spine TOCs).
+        hrefs = re.findall(r'href\s*=\s*[\"\']([^\"\']+)[\"\']', text, flags=re.IGNORECASE)
+        frag_links = 0
+        internal_links = 0
+        for h in hrefs:
+            hl = (h or '').strip().lower()
+            if not hl or _is_external_href(hl) or hl.startswith('#'):
+                continue
+            if '.xhtml' in hl or '.html' in hl or '.htm' in hl:
+                internal_links += 1
+                if '#' in h:
+                    frag_links += 1
+
+        # Strong signal for books whose "real" TOC is in the spine.
+        if frag_links >= 3:
+            score += 120
+        elif frag_links >= 1:
+            score += 60
+        else:
+            # Mild penalty for very flat nav docs when other options exist.
+            if base in ('nav.xhtml', 'nav.html') and internal_links >= 10:
+                score -= 20
+
+        ranked.append((score, c, frag_links, internal_links))
+
+    ranked.sort(key=lambda t: t[0], reverse=True)
+    return ranked
+
+
+def _find_best_toc_doc_path(zf: zipfile.ZipFile, ordered_content: list[str]) -> str:
+    """Choose a likely TOC/nav document inside an input EPUB.
+
+    We intentionally prefer *TOC-like* XHTML pages (many internal links, often with
+    #fragment anchors) over generic EPUB3 nav.xhtml when available, because many
+    books have richer TOC pages embedded in the spine.
+    """
+    ranked = _rank_toc_doc_paths(zf, ordered_content)
+    return ranked[0][1] if ranked else ''
+
+
+def _extract_ncx_navpoints_from_epub(zf: zipfile.ZipFile, mapper: "_AssetMapper", ordered_content: list[str]) -> list[tuple[str, str]]:
+    """Extract href-based NCX navpoints for one input EPUB.
+
+    Many EPUBs contain multiple TOC-like pages (per volume/part). We therefore
+    extract from the best candidates and merge/dedupe.
+    """
+    ranked = _rank_toc_doc_paths(zf, ordered_content)
+    if not ranked:
+        return []
+
+    # Prefer "rich" TOC pages that link to anchors within chapters.
+    rich = [path for _score, path, frag_links, internal_links in ranked if frag_links >= 1 and internal_links >= 5]
+
+    # Fall back to the single best candidate if no rich pages exist.
+    chosen = rich if rich else [ranked[0][1]]
+
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    # Limit how many pages we scan to keep things fast on huge books.
+    for toc_path in chosen[:25]:
+        try:
+            toc_xhtml = zf.read(toc_path).decode('utf-8', errors='replace')
+        except Exception:
+            continue
+        for src, label in _extract_ncx_navpoints_from_toc_xhtml(toc_xhtml, toc_path, mapper):
+            k = (src or '').lower()
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append((src, label))
+
+    return out
+
+
 
 def _detect_toc_heading(zf: zipfile.ZipFile) -> str:
     """Try to detect a suitable TOC heading label from an input EPUB.
@@ -440,11 +645,18 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   volume_number_start: int = 1,
                   volume_prefix_enabled: bool = True,
                   volume_toc_suffix: str = "Table of Contents",
+                  ncx_from_href_links: bool = False,
+                  ncx_from_spine: bool = True,
                   progress_callback=None) -> str:
     """Combine multiple EPUBs into *output_path*.
 
     Returns the absolute path of the created file.
     """
+    # Keep NCX generation logically consistent:
+    # - If href-based NCX is enabled, we run href-only (ignore sequential fallback).
+    if ncx_from_href_links:
+        ncx_from_spine = False
+
     tmp_dir = tempfile.mkdtemp(prefix="epub_combine_")
 
     try:
@@ -465,6 +677,14 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         manifest_items: list[dict] = []          # {id, href, media-type, properties?}
         spine_ids: list[str] = []
         spine_labels: list[str] = []             # display labels aligned to chapter numbering
+
+        # Optional: href-based NCX navpoints extracted from each input EPUB's own TOC/nav page.
+        href_based_ncx_navpoints: list[tuple[str, str]] = []
+
+        # If volume_toc_labeling is enabled, we may label certain TOC-like pages as
+        # "Volume N: Table of Contents". Track those pages so toc.ncx can always
+        # include them (even in href-only mode).
+        volume_toc_ncx_entries: list[tuple[str, str]] = []  # (src,label)
 
         total_epubs = len(epub_paths)
 
@@ -601,6 +821,16 @@ def combine_epubs(epub_paths: list[str], output_path: str,
 
                 mapper.finalize()
 
+                # If enabled, extract href-based NCX navpoints from this EPUB's own TOC/nav.
+                if ncx_from_href_links:
+                    try:
+                        href_based_ncx_navpoints.extend(
+                            _extract_ncx_navpoints_from_epub(zf, mapper, ordered_content)
+                        )
+                    except Exception:
+                        # Best-effort; never fail the combine because TOC parsing failed.
+                        pass
+
                 # --- Process content files ---
                 for i, content_name in enumerate(ordered_content, 1):
                     num = start_num + i
@@ -622,11 +852,16 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                         else:
                             label = suffix
                         toc_page_labeled_for_this_epub = True
+
+                        # Record this TOC page for the NCX so it doesn't get replaced
+                        # by a generic href-based entry like "目次".
+                        volume_toc_ncx_entries.append((f"Text/{num}.xhtml", label))
                     elif use_chapter_titles_in_toc:
                         # Extract a label before rewriting (so <title>/<h1> are original)
-                        label = _extract_doc_label(text) or f"Section {num}"
+                        label = _extract_doc_label(text) or ''
                     else:
-                        label = f"Section {num}"
+                        # User requested no auto-labels when chapter titles are disabled.
+                        label = ''
 
                     # Rewrite asset + content references
                     text = _rewrite_asset_refs(text, mapper, content_name)
@@ -682,8 +917,38 @@ def combine_epubs(epub_paths: list[str], output_path: str,
         with open(os.path.join(tmp_dir, "OEBPS", "content.opf"), 'w', encoding='utf-8') as f:
             f.write(opf)
 
-        # --- Write toc.ncx (minimal, for EPUB 2 readers) ---
-        ncx = _build_toc_ncx(title, book_uuid, spine_ids, spine_labels)
+        # --- Write toc.ncx (EPUB2 fallback TOC) ---
+        ncx_navpoints: list[tuple[str, str]] = []
+
+        volume_toc_bases = {(_split_ref_suffix(src)[0] or '').lower() for src, _ in volume_toc_ncx_entries}
+
+        # 0) Always include per-volume TOC page entries (if any).
+        # These are important labels like "Volume N: Table of Contents".
+        if volume_toc_ncx_entries:
+            ncx_navpoints.extend(volume_toc_ncx_entries)
+
+        # 1) Href-based (from source TOC/nav <a href> links)
+        if ncx_from_href_links and href_based_ncx_navpoints:
+            # Avoid letting an href-based navpoint into the TOC page itself (often
+            # labeled "目次") suppress the nicer Volume N label.
+            for src, label in href_based_ncx_navpoints:
+                base = (_split_ref_suffix(src)[0] or '').lower()
+                if base and base in volume_toc_bases:
+                    continue
+                ncx_navpoints.append((src, label))
+
+        # 2) Optional fallback: sequential spine entries ("filename-based")
+        if ncx_from_spine:
+            existing_bases = {(_split_ref_suffix(src)[0] or '').lower() for src, _ in ncx_navpoints}
+            for i in range(1, len(spine_ids) + 1):
+                src = f"Text/{i}.xhtml"
+                base = src.lower()
+                if base in existing_bases:
+                    continue
+                label = spine_labels[i - 1] if i - 1 < len(spine_labels) else f"Section {i}"
+                ncx_navpoints.append((src, label))
+
+        ncx = _build_toc_ncx(title, book_uuid, spine_ids, spine_labels, navpoints=ncx_navpoints)
         with open(os.path.join(tmp_dir, "OEBPS", "toc.ncx"), 'w', encoding='utf-8') as f:
             f.write(ncx)
 
@@ -836,7 +1101,24 @@ def _build_content_opf(title: str, uid: str,
     return '\n'.join(lines) + '\n'
 
 
-def _build_toc_ncx(title: str, uid: str, spine_ids: list[str], spine_labels: list[str]) -> str:
+def _build_toc_ncx(
+    title: str,
+    uid: str,
+    spine_ids: list[str],
+    spine_labels: list[str],
+    navpoints: Optional[list[tuple[str, str]]] = None,
+) -> str:
+    """Build an EPUB2 NCX.
+
+    If *navpoints* is provided, it is used as the navMap source; otherwise we fall
+    back to sequential spine entries.
+    """
+    if navpoints is None:
+        navpoints = []
+        for i, _sid in enumerate(spine_ids, 1):
+            label = spine_labels[i - 1] if i - 1 < len(spine_labels) else f"Section {i}"
+            navpoints.append((f"Text/{i}.xhtml", label))
+
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">',
@@ -849,12 +1131,25 @@ def _build_toc_ncx(title: str, uid: str, spine_ids: list[str], spine_labels: lis
         f'  <docTitle><text>{_xml_escape(title)}</text></docTitle>',
         '  <navMap>',
     ]
-    for i, sid in enumerate(spine_ids, 1):
-        label = spine_labels[i - 1] if i - 1 < len(spine_labels) else f"Section {i}"
-        lines.append(f'    <navPoint id="nav_{i}" playOrder="{i}">')
-        lines.append(f'      <navLabel><text>{_xml_escape(label)}</text></navLabel>')
-        lines.append(f'      <content src="Text/{i}.xhtml"/>')
+
+    play = 0
+    for src, label in navpoints:
+        src = (src or '').strip()
+        label = (label or '').strip()
+        if not src:
+            continue
+        if not label:
+            # Skip unlabeled entries entirely (user prefers no entry over blank text).
+            continue
+
+        play += 1
+        safe_src = _xml_escape(src)
+        safe_label = _xml_escape(label)
+        lines.append(f'    <navPoint id="nav_{play}" playOrder="{play}">')
+        lines.append(f'      <navLabel><text>{safe_label}</text></navLabel>')
+        lines.append(f'      <content src="{safe_src}"/>')
         lines.append('    </navPoint>')
+
     lines.append('  </navMap>')
     lines.append('</ncx>')
     return '\n'.join(lines) + '\n'
@@ -866,7 +1161,11 @@ def _build_nav_xhtml(title: str, spine_labels: list[str], toc_heading: str = "Co
 
     items = []
     for i, label in enumerate(spine_labels, 1):
-        safe_label = _xml_escape(label or f"Section {i}")
+        label = (label or '').strip()
+        if not label:
+            # Skip unlabeled entries entirely.
+            continue
+        safe_label = _xml_escape(label)
         items.append(f'        <li><a href="{i}.xhtml">{safe_label}</a></li>')
 
     return (
@@ -1080,10 +1379,22 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("""
             QMainWindow, QWidget { background-color: #1e1e1e; color: #e0e0e0; }
             QLabel { color: #e0e0e0; }
+            QLabel:disabled { color: #777; }
+
+            QCheckBox { color: #e0e0e0; }
+            QCheckBox:disabled { color: #777; }
+            /* Keep the platform's native checkbox indicator styling (avoids blue filled blocks).
+               Only tweak the disabled indicator so it looks obviously disabled in dark mode. */
+            QCheckBox::indicator:disabled {
+                border: 1px solid #444;
+                background-color: #2a2a2a;
+            }
+
             QLineEdit {
                 background-color: #2d2d2d; color: #e0e0e0;
                 border: 1px solid #3a3a3a; border-radius: 3px; padding: 4px;
             }
+            QLineEdit:disabled { color: #777; border-color: #2a2a2a; }
             QTreeWidget {
                 background-color: #252526; color: #e0e0e0;
                 alternate-background-color: #2a2a2a;
@@ -1257,6 +1568,11 @@ class MainWindow(QMainWindow):
         volume_number_start = int(self._cfg.get('volume_number_start', 1) or 1)
         volume_prefix_enabled = bool(self._cfg.get('volume_prefix_enabled', True))
         volume_toc_suffix = self._cfg.get('volume_toc_suffix', 'Table of Contents') or 'Table of Contents'
+        ncx_from_href_links = bool(self._cfg.get('ncx_from_href_links', False))
+        ncx_from_spine = bool(self._cfg.get('ncx_from_spine', True))
+        # Href-based NCX enabled => href-only (ignore sequential fallback setting).
+        if ncx_from_href_links:
+            ncx_from_spine = False
 
         try:
             result = combine_epubs(paths, save_path, title=title,
@@ -1270,6 +1586,8 @@ class MainWindow(QMainWindow):
                                    volume_number_start=volume_number_start,
                                    volume_prefix_enabled=volume_prefix_enabled,
                                    volume_toc_suffix=volume_toc_suffix,
+                                   ncx_from_href_links=ncx_from_href_links,
+                                   ncx_from_spine=ncx_from_spine,
                                    progress_callback=on_progress)
             self.progress.setValue(100)
             self.progress.setFormat("Done!")
@@ -1351,13 +1669,35 @@ class SettingsDialog(QDialog):
         self._sync_heading_visibility()
 
         # TOC entry labels
-        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else Section 1, 2, …)")
+        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else skipped)")
         self.use_chapter_titles_checkbox.setToolTip(
             "Checked: TOC entry labels come from each chapter's <title>/<h1>. "
-            "Unchecked: entries are named Section 1, Section 2, etc."
+            "Unchecked: chapters without existing TOC link text will be omitted from the TOC."
         )
         self.use_chapter_titles_checkbox.setChecked(bool(cfg.get('use_chapter_titles_in_toc', True)))
         layout.addWidget(self.use_chapter_titles_checkbox)
+
+        # NCX generation (EPUB2 fallback TOC)
+        self.ncx_from_href_links_checkbox = QCheckBox("toc.ncx: build from existing <a href> links (source TOC/nav)")
+        self.ncx_from_href_links_checkbox.setToolTip(
+            "If checked, toc.ncx will try to follow the source book's TOC/nav hyperlinks. "
+            "This can preserve per-chapter anchors and custom ordering."
+        )
+        self.ncx_from_href_links_checkbox.setChecked(bool(cfg.get('ncx_from_href_links', False)))
+        layout.addWidget(self.ncx_from_href_links_checkbox)
+
+        self.ncx_from_spine_checkbox = QCheckBox("toc.ncx: include sequential entries (filename-based fallback)")
+        self.ncx_from_spine_checkbox.setToolTip(
+            "Sequential fallback entries (Text/1.xhtml, Text/2.xhtml, …) for toc.ncx. "
+            "This is disabled when href-based toc.ncx generation is enabled."
+        )
+        self.ncx_from_spine_checkbox.setChecked(bool(cfg.get('ncx_from_spine', True)))
+        layout.addWidget(self.ncx_from_spine_checkbox)
+
+        # Keep NCX-related toggles in a consistent state.
+        self.ncx_from_href_links_checkbox.stateChanged.connect(self._sync_ncx_controls)
+        self.ncx_from_spine_checkbox.stateChanged.connect(self._sync_ncx_controls)
+        self._sync_ncx_controls()
 
         # Include/exclude nav/toc
         self.exclude_nav_checkbox = QCheckBox("Exclude original nav pages")
@@ -1424,6 +1764,8 @@ class SettingsDialog(QDialog):
             'toc_heading_mode': 'source' if self.use_source_toc_heading.isChecked() else 'fixed',
             'toc_heading_fixed': self.toc_heading_entry.text().strip() or 'Contents',
             'use_chapter_titles_in_toc': bool(self.use_chapter_titles_checkbox.isChecked()),
+            'ncx_from_href_links': bool(self.ncx_from_href_links_checkbox.isChecked()),
+            'ncx_from_spine': bool(self.ncx_from_spine_checkbox.isChecked()),
             'exclude_nav_docs': bool(self.exclude_nav_checkbox.isChecked()),
             'exclude_toc_docs': bool(self.exclude_toc_checkbox.isChecked()),
             'exclude_container_docs': bool(self.exclude_container_checkbox.isChecked()),
@@ -1440,6 +1782,20 @@ class SettingsDialog(QDialog):
 
     def _sync_volume_toc_visibility(self, _state=None):
         self.volume_options_widget.setVisible(self.volume_toc_labeling_checkbox.isChecked())
+
+    def _sync_ncx_controls(self, _state=None):
+        """Disable/force options that don't make sense together.
+
+        If href-based NCX is disabled, we must fall back to spine-based NCX.
+        """
+        href = self.ncx_from_href_links_checkbox.isChecked()
+        if href:
+            # Href-based NCX enabled => href-only. Sequential fallback would contradict.
+            # Disable the checkbox (greyed out), but DO NOT change its check state.
+            self.ncx_from_spine_checkbox.setEnabled(False)
+        else:
+            # Href-based is off: sequential fallback is applicable.
+            self.ncx_from_spine_checkbox.setEnabled(True)
 
 
 # ---------------------------------------------------------------------------

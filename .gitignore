@@ -11,3 +11,8 @@ __pycache__/
 # Data / outputs
 *.epub
 *.json
+
+# Generated EPUB folder structure (if you extract/build in-place)
+OEBPS/
+META-INF/
+mimetype
