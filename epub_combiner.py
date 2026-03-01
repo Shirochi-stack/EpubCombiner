@@ -718,7 +718,7 @@ def combine_epubs(epub_paths: list[str], output_path: str,
                   exclude_nav_docs: bool = True,
                   exclude_toc_docs: bool = True,
                   exclude_container_docs: bool = True,
-                  volume_toc_labeling: bool = False,
+                  volume_toc_labeling: bool = True,
                   volume_number_start: int = 1,
                   volume_prefix_enabled: bool = True,
                   volume_toc_suffix: str = "Table of Contents",
@@ -1761,7 +1761,7 @@ class MainWindow(QMainWindow):
         exclude_nav_docs = bool(self._cfg.get('exclude_nav_docs', True))
         exclude_toc_docs = bool(self._cfg.get('exclude_toc_docs', True))
         exclude_container_docs = bool(self._cfg.get('exclude_container_docs', True))
-        volume_toc_labeling = bool(self._cfg.get('volume_toc_labeling', False))
+        volume_toc_labeling = bool(self._cfg.get('volume_toc_labeling', True))
         volume_number_start = int(self._cfg.get('volume_number_start', 1) or 1)
         volume_prefix_enabled = bool(self._cfg.get('volume_prefix_enabled', True))
         volume_toc_suffix = self._cfg.get('volume_toc_suffix', 'Table of Contents') or 'Table of Contents'
@@ -1865,23 +1865,23 @@ class SettingsDialog(QDialog):
         self.use_source_toc_heading.stateChanged.connect(self._sync_heading_visibility)
         self._sync_heading_visibility()
 
-        # TOC entry labels
-        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else skipped)")
-        self.use_chapter_titles_checkbox.setToolTip(
-            "Checked: TOC entry labels come from each chapter's <title>/<h1>. "
-            "Unchecked: chapters without existing TOC link text will be omitted from the TOC."
-        )
-        self.use_chapter_titles_checkbox.setChecked(bool(cfg.get('use_chapter_titles_in_toc', False)))
-        layout.addWidget(self.use_chapter_titles_checkbox)
-
         # NCX generation (EPUB2 fallback TOC)
         self.ncx_from_href_links_checkbox = QCheckBox("toc.ncx: build from existing <a href> links (source TOC/nav)")
         self.ncx_from_href_links_checkbox.setToolTip(
-            "If checked, toc.ncx will try to follow the source book's TOC/nav hyperlinks. "
+            "If checked, toc.ncx (and nav.xhtml) will try to follow the book's existing TOC hyperlinks. "
             "This can preserve per-chapter anchors and custom ordering."
         )
         self.ncx_from_href_links_checkbox.setChecked(bool(cfg.get('ncx_from_href_links', True)))
         layout.addWidget(self.ncx_from_href_links_checkbox)
+
+        # TOC entry labels (only relevant when NOT using href-based TOC generation)
+        self.use_chapter_titles_checkbox = QCheckBox("Use chapter titles for TOC entries (else skipped)")
+        self.use_chapter_titles_checkbox.setToolTip(
+            "Checked: when generating a sequential TOC, entry labels come from each chapter's <title>/<h1>. "
+            "Unchecked: chapters without existing TOC link text will be omitted from the TOC."
+        )
+        self.use_chapter_titles_checkbox.setChecked(bool(cfg.get('use_chapter_titles_in_toc', False)))
+        layout.addWidget(self.use_chapter_titles_checkbox)
 
         self.ncx_from_spine_checkbox = QCheckBox("toc.ncx: include sequential entries (filename-based fallback)")
         self.ncx_from_spine_checkbox.setToolTip(
@@ -1918,7 +1918,7 @@ class SettingsDialog(QDialog):
             "If enabled, pages that look like a Table of Contents (many internal links) will be labeled "
             "as 'Volume N: Table of Contents' in the combined TOC."
         )
-        self.volume_toc_labeling_checkbox.setChecked(bool(cfg.get('volume_toc_labeling', False)))
+        self.volume_toc_labeling_checkbox.setChecked(bool(cfg.get('volume_toc_labeling', True)))
         layout.addWidget(self.volume_toc_labeling_checkbox)
 
         # Associated fields (hidden unless enabled)
@@ -1981,18 +1981,22 @@ class SettingsDialog(QDialog):
         self.volume_options_widget.setVisible(self.volume_toc_labeling_checkbox.isChecked())
 
     def _sync_ncx_controls(self, _state=None):
-        """Disable/force options that don't make sense together.
+        """Disable options that don't make sense together.
 
-        If href-based NCX is disabled, we must fall back to spine-based NCX.
+        When href-based TOC generation is enabled, sequential/fallback options and
+        chapter-title labeling are not applicable.
         """
         href = self.ncx_from_href_links_checkbox.isChecked()
         if href:
             # Href-based NCX enabled => href-only. Sequential fallback would contradict.
             # Disable the checkbox (greyed out), but DO NOT change its check state.
             self.ncx_from_spine_checkbox.setEnabled(False)
+            # Chapter-title labeling is irrelevant in href-based mode.
+            self.use_chapter_titles_checkbox.setEnabled(False)
         else:
-            # Href-based is off: sequential fallback is applicable.
+            # Href-based is off: sequential fallback and chapter-title labeling are applicable.
             self.ncx_from_spine_checkbox.setEnabled(True)
+            self.use_chapter_titles_checkbox.setEnabled(True)
 
 
 # ---------------------------------------------------------------------------
